@@ -72,6 +72,10 @@ CURSOR_PROJECTS_DIR = os.path.expanduser("~/.cursor/projects")
 # shape as Cursor, so both sources feed the SAME office (each worker is tagged with
 # its `source` so the UI can tell a Cursor agent from a Claude Code agent).
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+# Third-party bridges (e.g. notion_agent_sync.py) write Claude-Code-shaped .jsonl
+# transcripts here so non-Cursor/non-Claude agent activity can show up in the same
+# office, tagged with its own `source` ("notion") rather than masquerading as Claude.
+NOTION_PROJECTS_DIR = os.path.expanduser("~/.notion-office/projects")
 
 # Office (working/desk) vs kitchen (waiting) is decided by TURN STATE, not raw
 # write-recency: a session is "working" while its latest turn is still IN PROGRESS
@@ -1112,6 +1116,144 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
     return result
 
 
+def parse_notion_agent(uuid, project, path, mtime, sub_files=None, full=False):
+    """Notion-bridged transcripts are already Claude-Code-shaped (see
+    notion_agent_sync.py), so reuse parse_claude_agent wholesale and just relabel
+    the source -- copy first, since parse_claude_agent's cache entry is a shared
+    dict keyed by this same uuid and must stay tagged "claude" for its own callers.
+    """
+    d = dict(parse_claude_agent(uuid, project, path, mtime, sub_files=sub_files, full=full))
+    d["source"] = "notion"
+    return d
+
+
+# Claude Desktop's Cowork ("Home" chat) launches a real Claude Code CLI session under
+# the hood -- same ~/.claude/projects/<uuid>.jsonl transcript discover_claude_transcripts
+# already reads. The only local trace that a given uuid came from Cowork (rather than a
+# bare `claude` CLI invocation) is a sibling metadata file the Desktop app keeps here,
+# keyed by that same uuid under the name `cliSessionId`.
+COWORK_SESSIONS_DIR = os.path.expanduser(
+    "~/Library/Application Support/Claude/claude-code-sessions")
+_COWORK_IDS_CACHE = {"ts": 0.0, "ids": set()}
+_COWORK_IDS_TTL = 10.0  # seconds -- matches the Notion sync's own poll cadence
+
+
+def _cowork_session_ids():
+    """cliSessionIds of every Claude Code session launched via Cowork, short-cached
+    since this walks a small local directory tree on every call otherwise."""
+    now = time.time()
+    if now - _COWORK_IDS_CACHE["ts"] < _COWORK_IDS_TTL:
+        return _COWORK_IDS_CACHE["ids"]
+    ids = set()
+    if os.path.isdir(COWORK_SESSIONS_DIR):
+        for root, _dirs, files in os.walk(COWORK_SESSIONS_DIR):
+            for fn in files:
+                if not (fn.startswith("local_") and fn.endswith(".json")):
+                    continue
+                try:
+                    with open(os.path.join(root, fn), "r", encoding="utf-8") as fh:
+                        cid = json.load(fh).get("cliSessionId")
+                except Exception:
+                    continue
+                if cid:
+                    ids.add(cid)
+    _COWORK_IDS_CACHE["ts"] = now
+    _COWORK_IDS_CACHE["ids"] = ids
+    return ids
+
+
+def parse_claude_or_cowork_agent(uuid, project, path, mtime, sub_files=None, full=False):
+    """Same transcript, same parser -- just relabels Cowork-launched sessions with
+    their own source so the UI can tell them apart from a bare `claude` CLI chat."""
+    d = parse_claude_agent(uuid, project, path, mtime, sub_files=sub_files, full=full)
+    if uuid in _cowork_session_ids():
+        d = dict(d)
+        d["source"] = "cowork"
+    return d
+
+
+# Cowork's "Home" chat (plain conversation, not the Code tab) is a DIFFERENT surface
+# from the Cowork-launched Code-tab sessions above -- it does not write into
+# ~/.claude/projects. Each Home session instead runs in its own fully sandboxed
+# ~/.claude-equivalent home under HOME_SESSIONS_DIR, one folder per session, which
+# holds a sidecar `local_<id>.json` (title, initial message, timestamps) alongside
+# a `.claude/projects/*/<cliSessionId>.jsonl` transcript in the exact same shape as
+# any other Claude Code chat. Confirmed by direct inspection -- not guessed.
+HOME_SESSIONS_DIR = os.path.expanduser(
+    "~/Library/Application Support/Claude/local-agent-mode-sessions")
+_HOME_INDEX_CACHE = {"ts": 0.0, "rows": []}
+_HOME_INDEX_TTL = 10.0
+
+
+def _home_session_index():
+    """[{"id": cliSessionId, "title": ..., "path": transcript_path}, ...] for every
+    Home chat session that has produced a real transcript so far. Short-cached like
+    the Cowork id lookup, since this walks ~245+ small directories per call otherwise."""
+    now = time.time()
+    if now - _HOME_INDEX_CACHE["ts"] < _HOME_INDEX_TTL:
+        return _HOME_INDEX_CACHE["rows"]
+    rows = []
+    if os.path.isdir(HOME_SESSIONS_DIR):
+        for root, _dirs, files in os.walk(HOME_SESSIONS_DIR):
+            for fn in files:
+                if not (fn.startswith("local_") and fn.endswith(".json")):
+                    continue
+                sidecar = os.path.join(root, fn)
+                try:
+                    with open(sidecar, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                except Exception:
+                    continue
+                cid = meta.get("cliSessionId")
+                if not cid:
+                    continue
+                session_dir = sidecar[: -len(".json")]  # local_<id>.json -> local_<id>/
+                projects_dir = os.path.join(session_dir, ".claude", "projects")
+                transcript = None
+                target = cid + ".jsonl"
+                if os.path.isdir(projects_dir):
+                    for r2, _d2, f2 in os.walk(projects_dir):
+                        if target in f2:
+                            transcript = os.path.join(r2, target)
+                            break
+                if transcript and os.path.isfile(transcript):
+                    rows.append({
+                        "id": cid,
+                        "title": meta.get("title") or "",
+                        "path": transcript,
+                    })
+    _HOME_INDEX_CACHE["ts"] = now
+    _HOME_INDEX_CACHE["rows"] = rows
+    return rows
+
+
+def discover_home_transcripts():
+    """Yield (uuid, project, path, mtime, sub_files) for every Home chat session
+    with a real transcript on disk -- same tuple shape as discover_claude_transcripts,
+    no subagents concept here so sub_files is always []."""
+    for row in _home_session_index():
+        try:
+            mtime = os.path.getmtime(row["path"])
+        except OSError:
+            continue
+        yield row["id"], "home", row["path"], mtime, []
+
+
+def parse_home_agent(uuid, project, path, mtime, sub_files=None, full=False):
+    """Home transcripts are standard Claude-Code-shaped .jsonl (each session's own
+    sandbox), so reuse parse_claude_agent wholesale -- then relabel source, and swap
+    in the sidecar's own `title` since the sandboxed cwd is a long generated path,
+    not a meaningful project name."""
+    d = dict(parse_claude_agent(uuid, project, path, mtime, sub_files=sub_files, full=full))
+    d["source"] = "home"
+    d["project"] = "Home"
+    for row in _home_session_index():
+        if row["id"] == uuid and row["title"]:
+            d["title"] = row["title"]
+            break
+    return d
+
+
 def discover_claude_transcripts():
     """Yield (uuid, project_dir, abspath, eff_mtime, sub_files) for Claude Code chats.
 
@@ -1169,6 +1311,42 @@ def discover_claude_transcripts():
     for uuid, lst in cands.items():
         eff_mtime, _n, project, jsonl, sf = max(lst, key=lambda c: (c[0], c[1]))
         yield uuid, project, jsonl, eff_mtime, sf
+
+
+def discover_notion_transcripts():
+    """Yield (page_id, project_dir, abspath, mtime, sub_files) for bridged Notion agents.
+
+    A separate local script (e.g. notion_agent_sync.py) polls some external source and
+    writes one Claude-Code-shaped ``~/.notion-office/projects/notion-office/<page_id>.jsonl``
+    per agent/thread. This just walks that folder the same way discover_claude_transcripts
+    walks CLAUDE_PROJECTS_DIR -- no subagents concept here, so sub_files is always [].
+    """
+    if not os.path.isdir(NOTION_PROJECTS_DIR):
+        return
+    try:
+        projects = os.listdir(NOTION_PROJECTS_DIR)
+    except OSError:
+        return
+    for project in projects:
+        pdir = os.path.join(NOTION_PROJECTS_DIR, project)
+        if not os.path.isdir(pdir):
+            continue
+        try:
+            entries = os.listdir(pdir)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith(".jsonl"):
+                continue
+            page_id = entry[: -len(".jsonl")]
+            jsonl = os.path.join(pdir, entry)
+            if not os.path.isfile(jsonl):
+                continue
+            try:
+                mtime = os.path.getmtime(jsonl)
+            except OSError:
+                continue
+            yield page_id, project, jsonl, mtime, []
 
 
 # --------------------------------------------------------------------------------------
@@ -1562,7 +1740,9 @@ def _session_dir_for(path):
 # uniformly. Each entry: (source_name, discover_fn, parse_fn).
 _SOURCES = [
     ("cursor", discover_transcripts, parse_agent),
-    ("claude", discover_claude_transcripts, parse_claude_agent),
+    ("claude", discover_claude_transcripts, parse_claude_or_cowork_agent),
+    ("home", discover_home_transcripts, parse_home_agent),
+    ("notion", discover_notion_transcripts, parse_notion_agent),
 ]
 
 
@@ -1899,6 +2079,9 @@ PAGE = r"""<!DOCTYPE html>
   #nametag .nt-badge.waiting{background:#4a4d56;color:#f4f5f7;}
   .nt-badge.src-cursor,.badge.src-cursor{background:#2b6d84;color:#eaf6fb;}
   .nt-badge.src-claude,.badge.src-claude{background:#d97757;color:#2a1409;}
+  .nt-badge.src-notion,.badge.src-notion{background:#5b5fc7;color:#eeeeff;}
+  .nt-badge.src-cowork,.badge.src-cowork{background:#c2437a;color:#fdeef5;}
+  .nt-badge.src-home,.badge.src-home{background:#c9932e;color:#2a1c07;}
   .nt-badge.scheduled,.badge.scheduled{background:#2f5fb0;color:#eaf1ff;}
   .nt-badge.workflow,.badge.workflow{background:#6a4fb0;color:#f1eaff;}
   #nametag .nt-meta{font-size:9px;color:var(--ink-lo);margin:6px 0 8px;}
@@ -1994,6 +2177,9 @@ PAGE = r"""<!DOCTYPE html>
       <span><i style="background:#7a4a00"></i>waiting (in kitchen)</span>
       <span><i style="background:#2b6d84"></i>Cursor</span>
       <span><i style="background:#d97757"></i>Claude Code</span>
+      <span><i style="background:#c2437a"></i>Claude Cowork</span>
+      <span><i style="background:#c9932e"></i>Cowork Home</span>
+      <span><i style="background:#5b5fc7"></i>Notion</span>
       <span><i style="background:#2f5fb0"></i>scheduled (courier)</span>
       <span><i style="background:#57c2d8"></i>finished (beach)</span>
     </div>
@@ -2059,9 +2245,12 @@ const PAL = {
 // derive a fun, deterministic appearance from the agent id.
 // NOTE: hash() is unsigned 32-bit, so we MUST use unsigned shifts (>>>) here -
 // a signed >> would go negative for high hashes and yield undefined colours.
+// hard-coded curly hair for one specific worker, on request -- everything else about
+// its appearance still comes from the normal per-id hash below.
+const CURLY_HAIR_ID = 'e3186b3d-3470-40b4-b96f-ad3195f79700';
 function featuresFor(id){
   const h = hash(id);
-  return {
+  const f = {
     skin: SKIN[(h>>>0) % SKIN.length],
     hair: HAIR[(h>>>3) % HAIR.length],
     shirt: SHIRTS[(h>>>6) % SHIRTS.length],
@@ -2076,6 +2265,8 @@ function featuresFor(id){
     outfit: (h>>>19) % 5,                  // 0 plain 1 zip 2 stripe 3 v-neck 4 hoodie
     lanyard: ((h>>>25) % 3) === 0,         // ~1/3 wear an office badge on a lanyard
   };
+  if(id === CURLY_HAIR_ID){ f.female = false; f.hairStyle = 7; }   // 7 = afro, the closest curly texture this sprite set has
+  return f;
 }
 // a small outfit detail + soft left-side sheen, shared by every sprite so the crowd
 // looks varied. cx = torso centre, topY = torso top, halfW = half the torso width.
@@ -5065,14 +5256,15 @@ function fmtTokens(n){ if(n==null) return null;
   if(n>=1e6) return (n/1e6).toFixed(n>=1e7?0:1)+'M tokens';
   if(n>=1e3) return Math.round(n/1e3)+'k tokens';
   return n+' tokens'; }
-// which tool made this worker -- Cursor vs Claude Code
-function srcLabel(source){ return source==='claude' ? 'Claude Code' : 'Cursor'; }
+// which tool made this worker -- Cursor vs Claude Code vs a bridged Notion agent
+const SRC_LABELS = { cursor:'Cursor', claude:'Claude Code', cowork:'Claude Cowork', home:'Cowork Home', notion:'Notion' };
+function srcLabel(source){ return SRC_LABELS[source] || SRC_LABELS.cursor; }
 function srcBadgeHTML(source){
-  const cls = source==='claude' ? 'src-claude' : 'src-cursor';
+  const cls = 'src-'+(SRC_LABELS[source] ? source : 'cursor');
   return '<span class="nt-badge '+cls+'">'+esc(srcLabel(source))+'</span>';
 }
 // small on-canvas source marker (a little colored sign floating above the head)
-const SRC_COLORS = { cursor:'#2b6d84', claude:'#d97757' };
+const SRC_COLORS = { cursor:'#2b6d84', claude:'#d97757', cowork:'#c2437a', home:'#c9932e', notion:'#5b5fc7' };
 function drawSourceTag(x, topY, source){
   const col = SRC_COLORS[source] || SRC_COLORS.cursor;
   // a 6x4 rounded plaque with a soft outline + top gloss, centered on x
@@ -5097,7 +5289,7 @@ async function openDetail(id){
   document.getElementById('d-name').textContent=nameFor(d.id);
   document.getElementById('d-sub').innerHTML=
     '<span class="badge '+d.status+'">'+d.status.toUpperCase()+'</span> '+
-    '<span class="badge '+(d.source==='claude'?'src-claude':'src-cursor')+'">'+esc(srcLabel(d.source).toUpperCase())+'</span> '+
+    '<span class="badge src-'+esc(SRC_LABELS[d.source]?d.source:'cursor')+'">'+esc(srcLabel(d.source).toUpperCase())+'</span> '+
     (d.scheduled?'<span class="badge scheduled">SCHEDULED</span> ':'')+'&nbsp; '+
     esc(d.project)+' &nbsp;·&nbsp; '+esc(d.last_activity_rel)+' &nbsp;·&nbsp; '+d.message_count+' msgs';
   const body=document.getElementById('dbody');
@@ -5137,8 +5329,12 @@ async function openDetail(id){
     }
     html+='</section>';
   }
-  const jumpHelp = d.source==='claude'
-    ? 'Claude Code has no public deep link to a past session yet. Use <b>Open Transcript File</b> to view the raw <code>.jsonl</code>, or <b>Copy Session ID</b> and resume with <code>claude --resume '+esc(d.id)+'</code>.'
+  const jumpHelp = (d.source==='claude'||d.source==='cowork')
+    ? 'Claude Code has no public deep link to a past session yet. Use <b>Open Transcript File</b> to view the raw <code>.jsonl</code>, or <b>Copy Session ID</b> and resume with <code>claude --resume '+esc(d.id)+'</code>'+(d.source==='cowork'?' (or reopen it from Cowork’s Home screen)':'')+'.'
+    : d.source==='home'
+    ? 'This is a Cowork Home chat, running in its own sandboxed session -- reopen it from Cowork\u2019s <b>Home</b> tab to continue it. Use <b>Open Transcript File</b> to view its raw <code>.jsonl</code>, or <b>Copy Session ID</b> to find it there.'
+    : d.source==='notion'
+    ? 'This is a bridged Notion agent/thread (see notion_agent_sync.py) -- there is no local session to resume. Use <b>Open Transcript File</b> to view the synced <code>.jsonl</code>, or open the source row directly in your Notion database.'
     : 'Cursor has no public deep link to a specific past chat session yet, so this id can\u2019t auto-open the chat. Use <b>Open Transcript File</b> to view the raw <code>.jsonl</code> in Cursor, or <b>Copy Session ID</b> and find it under the sidebar\u2019s Previous Chats.';
   html+='<section><h4>Jump back to this chat</h4><div class="box">'+jumpHelp+'<br><br>session id: '+esc(d.id)+'</div></section>';
   body.innerHTML=html; body.scrollTop=0;
@@ -5611,6 +5807,10 @@ def main():
                     help="list the projects/roots with active sessions, then exit")
     ap.add_argument("--no-cursor", action="store_true", help="hide Cursor agents")
     ap.add_argument("--no-claude", action="store_true", help="hide Claude Code agents")
+    ap.add_argument("--no-home", action="store_true",
+                    help="hide Cowork Home chat sessions")
+    ap.add_argument("--no-notion", action="store_true",
+                    help="hide bridged Notion agents (see notion_agent_sync.py)")
     ap.add_argument("--no-workflows", action="store_true",
                     help="hide dynamic workflow tents (the Workflow tool's runs)")
     ap.add_argument("--active-secs", type=float, default=120.0,
@@ -5628,9 +5828,12 @@ def main():
 
     sources = [name for name, _d, _p in _SOURCES
                if not (name == "cursor" and args.no_cursor)
-               and not (name == "claude" and args.no_claude)]
+               and not (name == "claude" and args.no_claude)
+               and not (name == "home" and args.no_home)
+               and not (name == "notion" and args.no_notion)]
     if not sources:
-        ap.error("--no-cursor and --no-claude can't both be set (nothing to show).")
+        ap.error("--no-cursor, --no-claude, --no-home and --no-notion can't all be set "
+                 "(nothing to show).")
 
     if args.list_projects:
         rows = list_projects(args.hours, sources=sources)
@@ -5663,6 +5866,10 @@ def main():
             dirs.append(("Cursor", CURSOR_PROJECTS_DIR))
         if "claude" in sources:
             dirs.append(("Claude Code", CLAUDE_PROJECTS_DIR))
+        if "home" in sources:
+            dirs.append(("Cowork Home", HOME_SESSIONS_DIR))
+        if "notion" in sources:
+            dirs.append(("Notion", NOTION_PROJECTS_DIR))
         missing = [(label, d) for label, d in dirs if not os.path.isdir(d)]
         if len(missing) == len(dirs):
             for label, d in missing:
@@ -5681,6 +5888,10 @@ def main():
             data_dirs.append(CURSOR_PROJECTS_DIR)
         if "claude" in sources:
             data_dirs.append(CLAUDE_PROJECTS_DIR)
+        if "home" in sources:
+            data_dirs.append(HOME_SESSIONS_DIR)
+        if "notion" in sources:
+            data_dirs.append(NOTION_PROJECTS_DIR)
         print("=" * 60)
         print("  AGENT OFFICE  (Game Boy edition)")
         print("=" * 60)
