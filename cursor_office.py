@@ -4793,9 +4793,31 @@ function startDog(now){
   };
 }
 
-// ---- 2) CAT walks into the KITCHEN, curls up and naps, then leaves ----
-const CAT_FURS=['#e09a4a','#9aa0a6','#caa97a','#cfcfcf'];  // ginger / grey / fawn / silver
-const CAT_SPOTS=[[490,556],[300,478],[200,556],[410,556]]; // open floor, clear of furniture
+// ---- 2) CAT: a real Bengal, with a real daily routine ----
+// One warm gold/tan Bengal coat (rosette-spotted, not a random palette -- this is a
+// specific cat, not a random one). After entering, it cycles through a handful of
+// true-to-life behaviors (roam, eat, drink, poop, chase, sit on a lap, perch on
+// furniture, rub against people/things) before eventually napping and leaving --
+// same outer envelope (in -> active -> napwalk -> sleep -> out) driven by
+// updateAmbient, with the "active" phase itself a small behavior FSM below.
+const CAT_FUR = '#d9a441';                                 // Bengal base coat (warm gold/tan)
+const CAT_SPOTS=[[490,556],[300,478],[200,556],[410,556]]; // established safe nap/roam floor spots, clear of furniture
+const CAT_BEHAVIOR_WEIGHTS = {roam:3, eat:1, drink:1, poop:0.6, chase:2, lap:1.4, perch:1.4, rub:1.6};
+const CAT_BEHAVIOR_DUR = {roam:5000, eat:4200, drink:2600, poop:3400, chase:6500, lap:7000, perch:6500, rub:2400};
+
+// food bowl + water bowl (right of the fridge) + litter box (far kitchen corner) +
+// two perch spots (fridge top, counter top) -- all derived from the real furniture
+// coordinates in drawKitchenProps, so they stay correct if that layout ever moves.
+function catStationSpots(){
+  const T = layout().kitchenTop;
+  return {
+    food:   [46, T+99],
+    water:  [66, T+99],
+    litter: [400, T+99],
+    perches: [[23, T+8], [340, T+21]],
+  };
+}
+
 function startCat(now){
   // choose the floor spot furthest from every agent (so the cat doesn't overlap)
   let best=CAT_SPOTS[0], bestD=-1;
@@ -4808,10 +4830,103 @@ function startCat(now){
   let nap = 120000 + Math.random()*120000;          // 2-4 min
   if(window.__catNapMs) nap = window.__catNapMs;     // testing override
   amb.cat = {
-    fur: CAT_FURS[(Math.random()*CAT_FURS.length)|0],
+    fur: CAT_FUR,
     dir, x: dir>0 ? -20 : W+20, y: best[1],
-    tx: best[0], state:'in', spd:74, napMs:nap, sleepUntil:0,
+    tx: best[0], ty: best[1], napSpot: best,
+    state:'in', spd:74, napMs:nap, sleepUntil:0,
+    behavior:null, walking:false, bStart:0, bUntil:0, roamNextAt:0,
+    cyclesLeft: 4 + ((Math.random()*4)|0),           // how many behaviors before it naps
+    toy:null, behaviorPersonId:null,
   };
+}
+
+// weighted-random pick from a {key:weight} map
+function weightedPick(weights){
+  const keys=Object.keys(weights); let total=0; for(const k of keys) total+=weights[k];
+  let r=Math.random()*total;
+  for(const k of keys){ r-=weights[k]; if(r<=0) return k; }
+  return keys[keys.length-1];
+}
+
+// choose the cat's next behavior (or, once it's done cycling, head to nap instead)
+function pickCatBehavior(c, now){
+  if(c.cyclesLeft<=0){
+    c.behavior=null; c.tx=c.napSpot[0]; c.ty=c.napSpot[1]; c.state='napwalk'; return;
+  }
+  c.cyclesLeft--;
+  const spots = catStationSpots();
+  let bh = weightedPick(CAT_BEHAVIOR_WEIGHTS);
+  const seated = people.filter(p=>p.kind==='work' && p.seated);
+  if(bh==='lap' && !seated.length) bh='roam';                 // no lap to sit on right now
+  let targetPerson=null;
+  if(bh==='rub'){
+    const cands = people.filter(p=> !(p.kind==='work'&&!p.seated));
+    if(cands.length) targetPerson = cands[(Math.random()*cands.length)|0];
+    else bh='roam';
+  }
+  c.behavior=bh;
+  c.bStart=now; c.bUntil=now+(CAT_BEHAVIOR_DUR[bh]||3000); c.walking=true; c.roamNextAt=0;
+  switch(bh){
+    case 'roam':
+      c.spd=140; c.roamNextAt=0; break;                        // handled per-tick below (keeps re-targeting)
+    case 'eat':  c.tx=spots.food[0];   c.ty=spots.food[1];   c.spd=90; break;
+    case 'drink':c.tx=spots.water[0];  c.ty=spots.water[1];  c.spd=90; break;
+    case 'poop': c.tx=spots.litter[0]; c.ty=spots.litter[1]; c.spd=90; break;
+    case 'chase': {
+      const rx=60+Math.random()*430, ry=460+Math.random()*90;
+      c.toy={x:rx,y:ry,vx:(Math.random()<0.5?-1:1)*(30+Math.random()*40),vy:(Math.random()<0.5?-1:1)*(20+Math.random()*25)};
+      c.tx=c.toy.x; c.ty=c.toy.y; c.spd=160; break;
+    }
+    case 'lap': {
+      const p=seated[(Math.random()*seated.length)|0];
+      c.behaviorPersonId=p.id; c.tx=p.deskX; c.ty=p.deskY+8; c.spd=110; break;
+    }
+    case 'perch': {
+      const s=spots.perches[(Math.random()*spots.perches.length)|0];
+      c.tx=s[0]; c.ty=s[1]; c.spd=110; break;
+    }
+    case 'rub': {
+      c.behaviorPersonId=targetPerson.id;
+      const seatedT = targetPerson.kind==='work' && targetPerson.seated;
+      const px_=seatedT?targetPerson.deskX:targetPerson.x, py_=seatedT?targetPerson.deskY:targetPerson.y;
+      c.tx=px_+(Math.random()<0.5?-14:14); c.ty=py_+8; c.spd=120; break;
+    }
+  }
+}
+
+// advance the cat's current behavior; called each tick while state==='active'
+function updateCatBehavior(c, now, sec){
+  if(c.behavior==='roam'){
+    // "runs around": keep re-targeting a new nearby safe spot every ~0.7-1.3s so it
+    // reads as actual zoomies rather than walk-once-then-freeze.
+    if(now>=c.roamNextAt){
+      const base = CAT_SPOTS[(Math.random()*CAT_SPOTS.length)|0];
+      c.tx = Math.max(50, Math.min(500, base[0]+(Math.random()*70-35)));
+      c.ty = Math.max(455, Math.min(556, base[1]+(Math.random()*40-20)));
+      c.roamNextAt = now + 700 + Math.random()*600;
+    }
+  }
+  if(c.behavior==='chase' && c.toy){
+    c.toy.x += c.toy.vx*sec; c.toy.y += c.toy.vy*sec;
+    if(c.toy.x<50||c.toy.x>500) c.toy.vx*=-1;
+    if(c.toy.y<455||c.toy.y>556) c.toy.vy*=-1;
+    c.toy.x=Math.max(50,Math.min(500,c.toy.x)); c.toy.y=Math.max(455,Math.min(556,c.toy.y));
+    if(Math.random()<0.02){ c.toy.vx=(Math.random()<0.5?-1:1)*(30+Math.random()*45); c.toy.vy=(Math.random()<0.5?-1:1)*(20+Math.random()*30); }
+    c.tx=c.toy.x; c.ty=c.toy.y;               // always chasing the toy's current spot
+  }
+  if(c.walking){
+    const dx=c.tx-c.x, dy=c.ty-c.y, d=Math.hypot(dx,dy);
+    if(d<=c.spd*sec+1 && c.behavior!=='roam' && c.behavior!=='chase'){
+      c.x=c.tx; c.y=c.ty; c.walking=false;    // arrived -> hold the stationary pose for the rest of the duration
+    } else if(d>0.5){
+      c.x+=dx/d*c.spd*sec; c.y+=dy/d*c.spd*sec; c.dir=dx>=0?1:-1;
+    }
+  }
+  if(now>=c.bUntil){
+    if(c.behavior==='chase') c.toy=null;
+    c.behaviorPersonId=null;
+    pickCatBehavior(c, now);
+  }
 }
 
 // ---- a tiny airliner drifts across the WINDOW sky, above the buildings, near the clouds ----
@@ -4857,8 +4972,14 @@ function updateAmbient(now, dt){
     if((d.dir>0 && d.x>W+44) || (d.dir<0 && d.x<-44)) amb.dog=null; }
   if(amb.cat){ const c=amb.cat;
     if(c.state==='in'){
-      if(Math.abs(c.tx-c.x) <= c.spd*sec+0.5){ c.x=c.tx; c.state='sleep'; c.sleepUntil=now+c.napMs; }
-      else c.x += Math.sign(c.tx-c.x)*c.spd*sec;
+      if(Math.abs(c.tx-c.x) <= c.spd*sec+0.5){ c.x=c.tx; c.y=c.ty; c.state='active'; pickCatBehavior(c, now); }
+      else { c.x += Math.sign(c.tx-c.x)*c.spd*sec; c.dir = c.tx>=c.x?1:-1; }
+    } else if(c.state==='active'){
+      updateCatBehavior(c, now, sec);
+    } else if(c.state==='napwalk'){
+      const dx=c.tx-c.x, dy=c.ty-c.y, d=Math.hypot(dx,dy);
+      if(d<=c.spd*sec+1){ c.x=c.tx; c.y=c.ty; c.state='sleep'; c.sleepUntil=now+c.napMs; }
+      else { c.x+=dx/d*c.spd*sec; c.y+=dy/d*c.spd*sec; c.dir=dx>=0?1:-1; }
     } else if(c.state==='sleep'){
       if(now>=c.sleepUntil){ c.state='out'; c.dir = (c.x < W/2) ? -1 : 1; }   // leave the nearer side
     } else { // out
@@ -4986,10 +5107,28 @@ function drawDog(d, t){
 
 // CAT: rounded curled body when sleeping (tail wrapped, Zzz rising), or a small
 // side-on walker when entering/leaving.
+// Bengal rosette spots -- a FIXED relative pattern (not re-randomized per frame, or
+// it would flicker like noise instead of reading as one cat's actual coat). Small
+// dark blotches scattered over the body/head, plus a light chest/belly patch and the
+// two dark cheek/forehead "M" lines every Bengal has.
+const BENGAL_BODY_SPOTS = [[-11,-4,3,2],[-3,-6,2.5,2],[5,-5,3,2],[-7,0,2.5,2],[2,1,3,2],[10,-1,2,2],[-13,2,2,2]];
+const BENGAL_HEAD_SPOTS = [[-3,-1,1.6,1.3],[3,-2,1.6,1.3]];
+function drawBengalMarkings(el, x, y, dir, furDk, cream){
+  // body rosettes (mirrored if facing left, since offsets are authored facing right)
+  for(const [dx,dy,rx,ry] of BENGAL_BODY_SPOTS) el(x+dx*dir, y+dy, rx, ry, furDk);
+  // white/cream chest patch (drawn low on the front of the body, whichever side that is)
+  el(x+dir*7, y+3, 4, 3, cream);
+}
+function drawBengalFace(el, px, hx, hy, dir, furDk, cream){
+  for(const [dx,dy,rx,ry] of BENGAL_HEAD_SPOTS) el(hx+dx*dir, hy+dy, rx, ry, furDk);
+  el(hx-1*dir, hy+3, 3, 2.4, cream);                          // cream muzzle
+  px(hx-1, hy-6, 1, 2, furDk); px(hx+2, hy-6, 1, 2, furDk);   // faint forehead "M" mark
+}
+
 function drawCat(c, t){
   ctx.save();
   scaleAbout(c.x, c.y, SC);
-  const fur=c.fur, furDk=shade(fur,-.30), furHi=shade(fur,.30), pink='#e79ab0', nose='#cf7a8e';
+  const fur=c.fur, furDk=shade(fur,-.40), furHi=shade(fur,.30), pink='#e79ab0', nose='#cf7a8e', cream='#f3e6c8';
   const el=(cx,cy,rx,ry,col)=>{ ctx.fillStyle=col; ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.fill(); };
   const x=c.x, y=c.y;
   const _now=performance.now();
@@ -4997,7 +5136,67 @@ function drawCat(c, t){
   const rp = react ? (_now-react.start)/(react.until-react.start) : 0;
   ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x, y+2, 16, 4, 0, 0, Math.PI*2); ctx.fill();
 
-  if(c.state==='sleep'){
+  // ---- stationary action poses (state==='active' && not currently walking there) ----
+  const acting = c.state==='active' && !c.walking && c.behavior;
+  if(acting && (c.behavior==='eat' || c.behavior==='drink')){
+    if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }
+    const bob=Math.sin(t*0.9)*1.5;                              // head bobbing down to the bowl, repeatedly
+    _leg(x-7,y-7,7,3,furDk); _leg(x-2,y-7,7,3,furDk); _leg(x+4,y-7,7,3,fur); _leg(x+8,y-7,7,3,fur);
+    ro(x-9, y-11, 18, 6, fur); px(x-9,y-11,18,2,furHi);         // lowered body
+    px(x-11, y-15, 3, 6, fur);                                   // tail flat behind
+    const hx=x+8, hy=y-9+Math.abs(bob);                         // head dips toward the bowl
+    ro(hx, hy, 10, 9, fur); px(hx,hy,10,2,furHi);
+    px(hx,hy-4,4,5,fur); px(hx+6,hy-4,4,5,fur);
+    px(hx+7,hy+3,2,2,PAL.outline);
+    drawBengalMarkings(el, x, y-8, 1, furDk, cream);
+    drawBengalFace(el, px, hx, hy, 1, furDk, cream);
+    if(c.behavior==='drink'){ // little ripple flicks off the water bowl on each lap
+      const rr=(t*3)%3; ctx.strokeStyle='rgba(120,180,220,'+(1-rr/3).toFixed(2)+')'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.arc(hx+9, hy+8, 2+rr, 0, Math.PI*2); ctx.stroke();
+    }
+  } else if(acting && c.behavior==='poop'){
+    if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }
+    el(x, y-6, 13, 7, fur); el(x, y-9, 9, 4, furHi);              // low crouched body, tail tucked
+    px(x-9, y-4, 3, 3, furDk);
+    const hx=x+8, hy=y-13;
+    ro(hx, hy, 9, 8, fur); px(hx,hy-3,3,4,fur); px(hx+5,hy-3,3,4,fur);
+    px(hx+6,hy+2,2,2,PAL.outline);
+    drawBengalFace(el, px, hx, hy, 1, furDk, cream);
+    if((Math.floor(t*0.3)%2)===0) px(x-13, y+1, 3, 2, 'rgba(210,200,180,.5)');  // discreet little "poof" -- tasteful, not graphic
+  } else if(acting && (c.behavior==='perch' || c.behavior==='lap')){
+    // upright SIT: rounded haunches, tail curled around the front paws, alert head
+    el(x, y-8, 10, 11, fur); el(x, y-13, 7, 5, furHi);            // haunches/back
+    px(x-6, y-2, 3, 5, fur); px(x+3, y-2, 3, 5, fur);             // front paws
+    ctx.strokeStyle=furDk; ctx.lineWidth=3; ctx.beginPath(); ctx.arc(x+2, y-3, 9, 0.4, 2.6); ctx.stroke();
+    const hx=x, hy=y-20;
+    ro(hx, hy, 10, 10, fur); px(hx,hy,10,2,furHi);
+    px(hx-3,hy-4,4,5,fur); px(hx+6,hy-4,4,5,fur);
+    px(hx-2,hy-3,2,3,pink); px(hx+5,hy-3,2,3,pink);
+    px(hx+1,hy+4,2,2,PAL.outline); px(hx+7,hy+4,2,2,PAL.outline);
+    px(hx+8,hy+6,2,2,nose);
+    drawBengalMarkings(el, x, y-9, 1, furDk, cream);
+    drawBengalFace(el, px, hx, hy, 1, furDk, cream);
+    if(c.behavior==='lap'){ // purring on someone's lap -- little floating music notes
+      const f=(t*0.5)%1; ctx.fillStyle=PAL.leafDk; ctx.font='6px "Press Start 2P", monospace';
+      ctx.fillText('♪', x+9-f*3, y-24-f*8);
+    }
+  } else if(acting && c.behavior==='rub'){
+    if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }
+    const sway=Math.sin(t*2.4)*3;                                 // rubbing side-to-side against the target
+    ctx.save(); ctx.translate(sway,0);
+    _leg(x-7,y-7,7,3,furDk); _leg(x-2,y-7,7,3,furDk); _leg(x+4,y-7,7,3,fur); _leg(x+8,y-7,7,3,fur);
+    ro(x-9, y-13, 18, 7, fur); px(x-9,y-13,18,2,furHi);
+    px(x-11, y-19, 3, 9, fur); px(x-12, y-23, 3, 5, furDk);        // tail up high (affectionate)
+    const hx=x+7, hy=y-19;
+    ro(hx, hy, 11, 10, fur); px(hx,hy,11,2,furHi);
+    px(hx, hy-4, 4, 5, fur); px(hx+7, hy-4, 4, 5, fur);
+    px(hx+1,hy-3,2,3,pink); px(hx+8,hy-3,2,3,pink);
+    px(hx+8, hy+4, 2, 2, PAL.outline); px(hx+10, hy+6, 2, 2, nose);
+    drawBengalMarkings(el, x, y-8, 1, furDk, cream);
+    drawBengalFace(el, px, hx, hy, 1, furDk, cream);
+    ctx.restore();
+    miniHeart(x+2, y-27);
+  } else if(c.state==='sleep'){
     el(x, y-6, 15, 9, fur);                           // curled body
     el(x, y-9, 11, 5, furHi);                         // back highlight
     el(x-9, y-3, 7, 6, fur);                          // tucked head (front-left)
@@ -5005,6 +5204,8 @@ function drawCat(c, t){
     px(x-9, y-12, 4, 6, fur);  px(x-9,y-12,4,2,furHi);  // ear
     px(x-12, y-3, 4, 1, PAL.outline);                 // closed eye (sleepy arc)
     px(x-13, y-2, 1, 1, PAL.outline); px(x-8, y-2, 1, 1, PAL.outline);
+    drawBengalMarkings(el, x, y-6, -1, furDk, cream);
+    for(const [dx,dy,rx,ry] of BENGAL_HEAD_SPOTS) el(x-9-dx, y-3+dy, rx*0.8, ry*0.8, furDk);
     // tail wrapped around the front of the body
     ctx.strokeStyle=furDk; ctx.lineWidth=3; ctx.beginPath();
     ctx.arc(x+2, y-4, 12, -0.2, 1.5); ctx.stroke();
@@ -5028,13 +5229,16 @@ function drawCat(c, t){
       for(let i=0;i<3;i++){ ctx.beginPath(); ctx.moveTo(x-7+i*6, y-19); ctx.lineTo(x-2+i*6, y-1); ctx.stroke(); }
     }
   } else {
+    ctx.save();                                                                // scope the facing-direction flip
     if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }  // face walk dir
-    const ph=(Math.floor(t*0.4)&1)?1:-1;
+    const running = c.behavior==='chase' || c.behavior==='roam';
+    const legF = running ? 0.9 : 0.4;                                          // faster legs when running/chasing
+    const ph=(Math.floor(t*legF)&1)?1:-1;
     _leg(x-7, y-7, 7+ph, 3, furDk); _leg(x-2, y-7, 7-ph, 3, furDk);
     _leg(x+4, y-7, 7-ph, 3, fur);  _leg(x+8, y-7, 7+ph, 3, fur);
     ro(x-9, y-13, 18, 7, fur); px(x-9,y-13,18,2,furHi);   // body
-    // upright tail with a slight wag
-    const wag=Math.round(Math.sin(t*0.5)*2);
+    // upright tail with a slight wag (whips faster mid-chase)
+    const wag=Math.round(Math.sin(t*(running?1.6:0.5))*(running?4:2));
     px(x-11, y-18+wag, 3, 8, fur); px(x-12, y-22+wag, 3, 5, furDk);
     // head (front-right) with ears + face
     const hx=x+7, hy=y-19;
@@ -5043,6 +5247,13 @@ function drawCat(c, t){
     px(hx+1, hy-3, 2, 3, pink); px(hx+8, hy-3, 2, 3, pink);
     px(hx+8, hy+4, 2, 2, PAL.outline);                   // eye
     px(hx+10, hy+6, 2, 2, nose);                         // nose
+    drawBengalMarkings(el, x, y-10, 1, furDk, cream);
+    drawBengalFace(el, px, hx, hy, 1, furDk, cream);
+    ctx.restore();                                                             // back to the un-mirrored transform
+    if(c.behavior==='chase' && c.toy){                    // the toy is a real absolute-world point, drawn unmirrored
+      const tx_=c.toy.x, ty_=c.toy.y;
+      el(tx_, ty_, 3, 2, '#d2452f'); px(tx_-1, ty_-2, 1, 2, PAL.outline); px(tx_+1, ty_-2, 1, 2, PAL.outline);
+    }
   }
   ctx.restore();
 }
