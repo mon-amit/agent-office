@@ -2652,6 +2652,32 @@ function drawFloor(){
 
   drawOfficeProps();
   drawKitchenProps();
+  drawPetBowls();
+}
+
+// ---- cat + dog feeding stations (drawn as real static props, not just target coords) ----
+const DOG_BOWL_X = 65, DOG_BOWL_Y_OFFSET = -24;   // dog eats in its own walking lane, just above the kitchen divider
+function drawBowl(x, y, contentsCol){
+  ctx.fillStyle='rgba(0,0,0,.15)'; ctx.beginPath(); ctx.ellipse(x, y+2, 7, 2.4, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle='#c9c9c9'; ctx.beginPath(); ctx.ellipse(x, y, 7, 4, 0, 0, Math.PI*2); ctx.fill();       // outer rim
+  ctx.fillStyle='#e8e8e8'; ctx.beginPath(); ctx.ellipse(x, y-1, 6, 3.2, 0, 0, Math.PI*2); ctx.fill();   // inner bowl face
+  ctx.fillStyle=contentsCol; ctx.beginPath(); ctx.ellipse(x, y-1, 4.4, 2.2, 0, 0, Math.PI*2); ctx.fill();
+}
+function drawLitterBox(x, y){
+  ctx.fillStyle='rgba(0,0,0,.15)'; ctx.beginPath(); ctx.ellipse(x, y+4, 15, 3, 0, 0, Math.PI*2); ctx.fill();
+  px(x-14, y-5, 28, 9, '#8f95a0'); px(x-14, y-5, 28, 2, '#a8adb6');    // gray tray + top rim highlight
+  px(x-12, y-2, 24, 4, '#d8c9a0');                                      // litter fill
+  for(const [dx,dy] of [[-8,-1],[-2,0],[3,-1],[7,0],[-5,1]]) px(x+dx, y-1+dy, 1, 1, '#c2b28a');  // texture flecks
+}
+function drawPetBowls(){
+  const spots = catStationSpots();
+  drawBowl(spots.food[0], spots.food[1], '#c98a3a');     // kibble
+  drawBowl(spots.water[0], spots.water[1], '#6fa8d8');   // water
+  drawLitterBox(spots.litter[0], spots.litter[1]);
+  // dog's own bowls, in its walking lane (just above the kitchen divider line)
+  const dy = layout().kitchenTop + DOG_BOWL_Y_OFFSET;
+  drawBowl(DOG_BOWL_X, dy, '#c98a3a');
+  drawBowl(DOG_BOWL_X+13, dy, '#6fa8d8');
 }
 
 // ---- furniture / decor helpers ----
@@ -4383,6 +4409,19 @@ function tick(now){
         }
         p.y=Math.max(L.kitchenTop+44,Math.min(H-20,p.y));
       }
+      // an idle agent that wandered over to pet the cat/dog on its own (see
+      // startAgentPet): walk there -> pet -> walk back -> done, in three small phases.
+      if(p.petTask){
+        if(p.petTask.phase==='to' && p.mode==='idle'){
+          p.petTask.phase='petting'; p.petTask.until=now+1400;
+          if(p.petTask.petKind==='cat' && amb.cat) petCat();
+          else if(p.petTask.petKind==='dog' && amb.dog) petDog();
+        } else if(p.petTask.phase==='petting' && now>=p.petTask.until){
+          p.petTask.phase='return'; p.home=p.petTask.originalHome; p.mode='walk';
+        } else if(p.petTask.phase==='return' && p.mode==='idle'){
+          p.petTask=null;
+        }
+      }
     }
   }
   // reap agents that have finished going under: hide them (until active again) & clear the
@@ -4769,14 +4808,35 @@ function schedulePlane(now){
 // pick ONE event at random, avoiding an immediate repeat; if the chosen type can't
 // run (dog/cat already on screen, or no waiting agent for a relocate) try another.
 function fireRandomEvent(now){
-  const types=[1,2,3];
+  const types=[1,2,3,4];
   for(let i=types.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; const tmp=types[i]; types[i]=types[j]; types[j]=tmp; }
   if(types[0]===lastEventType){ types.push(types.shift()); }   // soft anti-repeat
   for(const t of types){
     if(t===1 && !amb.dog){ startDog(now); lastEventType=1; return; }
     if(t===2 && !amb.cat){ startCat(now); lastEventType=2; return; }
     if(t===3 && startRelocate(now)){ lastEventType=3; return; }
+    if(t===4 && startAgentPet(now)){ lastEventType=4; return; }
   }
+}
+
+// a currently-idle waiting agent (not the user) wanders over to pet whichever pet is
+// out and reachable, then returns to its original spot -- reuses the same petCat/
+// petDog reaction system the user's own clicks trigger.
+function startAgentPet(now){
+  let petKind=null, px_=null, py_=null;
+  if(amb.cat && (amb.cat.state==='active'||amb.cat.state==='sleep') && amb.cat.x>=20 && amb.cat.x<=396){
+    petKind='cat'; px_=amb.cat.x; py_=amb.cat.y;
+  } else if(amb.dog && amb.dog.x>=20 && amb.dog.x<=396){
+    petKind='dog'; px_=amb.dog.x; py_=amb.dog.y;
+  }
+  if(!petKind) return false;
+  const cands = people.filter(p=> p.kind==='wait' && p.mode==='idle' && !p.petTask);
+  if(!cands.length) return false;
+  const p = cands[(Math.random()*cands.length)|0];
+  p.petTask = { phase:'to', originalHome:{x:p.home.x, y:p.home.y}, petKind };
+  p.home = { x: px_ + (Math.random()<0.5?-16:16), y: py_+6 };
+  p.mode = 'walk';
+  return true;
 }
 
 // ---- 1) DOG walks across the OFFICE floor and exits ----
@@ -4790,6 +4850,9 @@ function startDog(now){
     x: dir>0 ? -36 : W+36,
     y: L.kitchenTop - 24,                            // near-front office lane (in front of desks)
     spd: 118 + Math.random()*26,                     // px/s -> ~4-5s to cross
+    // random eating cycle: most crossings, the dog detours to its bowl on the way
+    willEat: Math.random()<0.6, ateDone:false, eating:false, eatUntil:0,
+    willDrink: Math.random()<0.5, drankDone:false,
   };
 }
 
@@ -4829,6 +4892,10 @@ function startCat(now){
   const dir = best[0] < W/2 ? 1 : -1;                // enter from the nearer side
   let nap = 120000 + Math.random()*120000;          // 2-4 min
   if(window.__catNapMs) nap = window.__catNapMs;     // testing override
+  // guarantee a real, if randomly-timed, eating cycle each visit: eat AND drink WILL
+  // happen at some point, in a random order, rather than leaving it purely to chance
+  // whether weightedPick ever lands on them.
+  const forcedQueue = Math.random()<0.5 ? ['eat','drink'] : ['drink','eat'];
   amb.cat = {
     fur: CAT_FUR,
     dir, x: dir>0 ? -20 : W+20, y: best[1],
@@ -4836,7 +4903,7 @@ function startCat(now){
     state:'in', spd:74, napMs:nap, sleepUntil:0,
     behavior:null, walking:false, bStart:0, bUntil:0, roamNextAt:0,
     cyclesLeft: 4 + ((Math.random()*4)|0),           // how many behaviors before it naps
-    toy:null, behaviorPersonId:null,
+    toy:null, behaviorPersonId:null, forcedQueue,
   };
 }
 
@@ -4855,7 +4922,9 @@ function pickCatBehavior(c, now){
   }
   c.cyclesLeft--;
   const spots = catStationSpots();
-  let bh = weightedPick(CAT_BEHAVIOR_WEIGHTS);
+  // drain the forced eat/drink queue first (still randomly ORDERED, just guaranteed
+  // to happen at all), then fall back to normal weighted-random picking.
+  let bh = (c.forcedQueue && c.forcedQueue.length) ? c.forcedQueue.shift() : weightedPick(CAT_BEHAVIOR_WEIGHTS);
   const seated = people.filter(p=>p.kind==='work' && p.seated);
   if(bh==='lap' && !seated.length) bh='roam';                 // no lap to sit on right now
   let targetPerson=null;
@@ -4968,7 +5037,16 @@ function updateAmbient(now, dt){
   if(now>=nextEventAt){ fireRandomEvent(now); scheduleNextEvent(now); }
   const sec=dt/1000;
   if(amb.dog){ const d=amb.dog;
-    if(!(d.react && now<d.react.until)) d.x += d.dir*d.spd*sec;   // pause walking mid-pet
+    if(d.eating){
+      if(now>=d.eatUntil) d.eating=false;                          // done at the bowl -> resume crossing
+    } else if(!(d.react && now<d.react.until)){                    // pause walking mid-pet too
+      const foodX=DOG_BOWL_X, waterX=DOG_BOWL_X+13;
+      const passedFood  = d.dir>0 ? d.x>=foodX-3  : d.x<=foodX+3;
+      const passedWater = d.dir>0 ? d.x>=waterX-3 : d.x<=waterX+3;
+      if(d.willEat && !d.ateDone && passedFood){ d.eating=true; d.ateDone=true; d.eatUntil=now+2200; d.x=foodX; }
+      else if(d.willDrink && !d.drankDone && passedWater){ d.eating=true; d.drankDone=true; d.eatUntil=now+1800; d.x=waterX; }
+      else d.x += d.dir*d.spd*sec;
+    }
     if((d.dir>0 && d.x>W+44) || (d.dir<0 && d.x<-44)) amb.dog=null; }
   if(amb.cat){ const c=amb.cat;
     if(c.state==='in'){
@@ -5027,8 +5105,9 @@ function drawDog(d, t){
   const react=(d.react && _now<d.react.until)?d.react:null;
   const rp = react ? (_now-react.start)/(react.until-react.start) : 0;
   const jump = (react&&react.type==='jump') ? -Math.abs(Math.sin(rp*Math.PI))*11 : 0;
+  const eatBob = d.eating ? Math.abs(Math.sin(t*0.8))*3 : 0;    // head dips toward the bowl while eating/drinking
   const wagAmp=(react&&react.type==='wag')?4:2, wagSpd=(react&&react.type==='wag')?1.4:0.55;
-  const x=d.x, groundY=d.y, y=d.y+jump;
+  const x=d.x, groundY=d.y, y=d.y+jump+eatBob;
   const ph = (Math.floor(t*0.34)&1) ? 1 : -1;        // leg swing phase
   const bob = Math.round(Math.sin(t*0.30))|0;        // head bob (0/1)
   const wag = Math.round(Math.sin(t*wagSpd)*wagAmp); // tail wag (bigger/faster mid-pet)
@@ -5151,7 +5230,8 @@ function drawCat(c, t){
     drawBengalMarkings(el, x, y-8, 1, furDk, cream);
     drawBengalFace(el, px, hx, hy, 1, furDk, cream);
     if(c.behavior==='drink'){ // little ripple flicks off the water bowl on each lap
-      const rr=(t*3)%3; ctx.strokeStyle='rgba(120,180,220,'+(1-rr/3).toFixed(2)+')'; ctx.lineWidth=1;
+      const rr=((t*3)%3+3)%3;   // true positive modulo -- JS's %  can go negative for negative t
+      ctx.strokeStyle='rgba(120,180,220,'+(1-rr/3).toFixed(2)+')'; ctx.lineWidth=1;
       ctx.beginPath(); ctx.arc(hx+9, hy+8, 2+rr, 0, Math.PI*2); ctx.stroke();
     }
   } else if(acting && c.behavior==='poop'){
@@ -5177,7 +5257,7 @@ function drawCat(c, t){
     drawBengalMarkings(el, x, y-9, 1, furDk, cream);
     drawBengalFace(el, px, hx, hy, 1, furDk, cream);
     if(c.behavior==='lap'){ // purring on someone's lap -- little floating music notes
-      const f=(t*0.5)%1; ctx.fillStyle=PAL.leafDk; ctx.font='6px "Press Start 2P", monospace';
+      const f=((t*0.5)%1+1)%1; ctx.fillStyle=PAL.leafDk; ctx.font='6px "Press Start 2P", monospace';
       ctx.fillText('♪', x+9-f*3, y-24-f*8);
     }
   } else if(acting && c.behavior==='rub'){
