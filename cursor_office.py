@@ -2391,6 +2391,58 @@ const KSPOTS = [
   [255,548],[320,545],[365,540]                     // front-centre gap (between table and beach)
 ];
 
+// ---- OVERFLOW SEATING ---------------------------------------------------------------
+// Only TWO desk rows fit above the kitchen divider (row 0 at y=126, row 1 at y=254;
+// kitchenTop is 346). The desk grid used to grow unbounded to fit however many workers
+// existed, so a 7th concurrent worker got a desk at y=382 -- in the KITCHEN band -- a
+// 9th at (564,382) on the BEACH sand, and a 13th at y=638, entirely off the 576px canvas.
+// That is the real cause of "workers working outside the work area / at the beach / work
+// happening that we can't see". Desks are now hard-capped, and workers beyond the cap sit
+// somewhere real instead: first the kitchen table with a laptop, then the office floor
+// with a laptop on their lap.
+const DESK_CAP = 6;
+// Two seats at the kitchen lounge table (table is tx=66..182, ty=T+150). Chosen to sit on
+// the table's long sides, and deliberately >40px from every KSPOTS kitchen-stand spot so a
+// relocating waiter can never be placed on top of a seated worker.
+const KTABLE_SEATS = [
+  { x: 92,  y: 500, lx: 82,  dir: 1 },    // near side, laptop to the left of the sitter
+  { x: 160, y: 476, lx: 150, dir: -1 },   // far side, facing back toward the counter
+];
+// Floor spots in the OFFICE band (y 300..340: below the rug, above the divider), placed in
+// the horizontal GAPS between the three desk-column name-plates (plates span screen x
+// 98..182, 310..394 and 522..606) so a sitter's head never covers a plate. Two lanes so a
+// second overflow worker doesn't sit shoulder-to-shoulder with the first.
+const FLOOR_SPOTS = [
+  [232, 330], [462, 330],
+  [232, 302], [462, 302],
+];
+let ovfAssign = {};   // agent id -> overflow index (0..N); same stability contract as deskAssign
+
+// Resolve an overflow index to a concrete seat: table seats first, then floor spots, then
+// (only if BOTH are exhausted) a spread lane below the floor spots. The spread offsets BOTH
+// x and y per extra worker and never clamps two different indices onto the same point --
+// collapsing them would make every such worker share one hit-box and hide all but the first,
+// which is the exact class of bug this whole feature exists to remove.
+function ovfSpot(idx){
+  const nT = KTABLE_SEATS.length, nF = FLOOR_SPOTS.length;
+  if(idx < nT){
+    const s = KTABLE_SEATS[idx];
+    return { kind:'table', x:s.x, y:s.y, lx:s.lx, dir:s.dir };
+  }
+  const fi = idx - nT;
+  if(fi < nF){
+    const s = FLOOR_SPOTS[fi];
+    return { kind:'floor', x:s[0], y:s[1], lx:0, dir:1 };
+  }
+  // rare (11+ concurrent workers): fan out along the office floor band, wrapping in x and
+  // stepping in y, so each index still gets a unique point inside the office.
+  const k = fi - nF;
+  const lane = Math.floor(k/4);
+  const x = 200 + (k % 4) * 76;
+  const y = 316 + (lane % 2) * 18;
+  return { kind:'floor', x:Math.min(596, x), y:Math.min(338, y), lx:0, dir:1 };
+}
+
 // stable BEACH rest spots for finished agents (all in the right band, x > BEACH_X and
 // LEFT of SHORE_X so they sit on the sand, clear of the ocean and the umbrella).
 const BSPOTS = [
@@ -2435,9 +2487,26 @@ function rebuild(){
   Object.keys(deskAssign).forEach(id=>{ if(!workerIds.has(id)) delete deskAssign[id]; });
   Object.keys(seatAssign).forEach(id=>{ if(!waiterIds.has(id)) delete seatAssign[id]; });
   Object.keys(beachAssign).forEach(id=>{ if(!beacherIds.has(id)) delete beachAssign[id]; });
-  // give brand-new workers the lowest free desk index (stable thereafter)
+  Object.keys(ovfAssign).forEach(id=>{ if(!workerIds.has(id)) delete ovfAssign[id]; });
+  // give brand-new workers the lowest free desk index (stable thereafter), but never above
+  // the cap -- anyone who can't get a real desk gets a stable OVERFLOW index instead.
   const usedSlots = new Set(Object.values(deskAssign));
-  workers.forEach(a=>{ if(deskAssign[a.id]==null){ let i=0; while(usedSlots.has(i)) i++; deskAssign[a.id]=i; usedSlots.add(i); } });
+  const usedOvf = new Set(Object.values(ovfAssign));
+  workers.forEach(a=>{
+    if(deskAssign[a.id]!=null || ovfAssign[a.id]!=null) return;   // already placed, keep it
+    let i=0; while(usedSlots.has(i)) i++;
+    if(i < DESK_CAP){ deskAssign[a.id]=i; usedSlots.add(i); }
+    else { let j=0; while(usedOvf.has(j)) j++; ovfAssign[a.id]=j; usedOvf.add(j); }
+  });
+  // a desk freed up (someone stopped working) -> promote the longest-standing overflow
+  // worker into it, so the office fills its real seats first. Promotion walks the agent
+  // over using the existing walk mechanics rather than teleporting.
+  for(const id of Object.keys(ovfAssign).sort((a,b)=>ovfAssign[a]-ovfAssign[b])){
+    let i=0; while(usedSlots.has(i)) i++;
+    if(i >= DESK_CAP) break;                    // no real desk free -> everyone else stays put
+    deskAssign[id]=i; usedSlots.add(i);
+    usedOvf.delete(ovfAssign[id]); delete ovfAssign[id];
+  }
   const usedSeats = new Set(Object.values(seatAssign));
   waiters.forEach(a=>{ if(seatAssign[a.id]==null){ let i=0; while(usedSeats.has(i)) i++; seatAssign[a.id]=i; usedSeats.add(i); } });
   const usedBeach = new Set(Object.values(beachAssign));
@@ -2447,7 +2516,9 @@ function rebuild(){
   // furnished even when nobody is working). Sized to fit the highest used slot.
   const cols = 3;
   const maxSlot = Object.values(deskAssign).reduce((m,v)=>Math.max(m,v), -1);
-  const need = Math.max(6, Math.ceil((maxSlot+1)/cols)*cols);
+  // HARD CAP at DESK_CAP: the grid must never grow a third row, which would place desks
+  // below kitchenTop (in the kitchen/on the beach) or off the bottom of the canvas.
+  const need = Math.min(DESK_CAP, Math.max(6, Math.ceil((maxSlot+1)/cols)*cols));
   // tighter grid sized for the bigger (SC) desks so the office reads as full
   const left = 140, right = W-140, top = WALL_H+48, rowH = 128;   // wider insets (edge desks fit their dwarves/easels) + taller rows (more gap between the 2 rows)
   deskSlots = [];
@@ -2461,21 +2532,30 @@ function rebuild(){
   const SEA = { x: SHORE_X + Math.round(WATER_W*0.5), y: L.kitchenTop + Math.round((H-L.kitchenTop)*0.45) };
   workers.forEach(a=>{
     const old = prevById[a.id];
-    const slot = deskSlots[deskAssign[a.id]];
-    // already seated at THIS desk? stay seated. Otherwise walk in and then sit.
+    const di = deskAssign[a.id];
+    const slot = (di!=null) ? deskSlots[di] : null;
+    // No real desk? Take an overflow seat: kitchen table first, then the office floor.
+    // ovfSpot() always returns a concrete in-bounds point, so there is no path where a
+    // working agent ends up without somewhere real to be.
+    const ovf = slot ? null : ovfSpot(ovfAssign[a.id] || 0);
+    const px_ = slot ? slot.x : ovf.x, py_ = slot ? slot.y : ovf.y;
+    // already seated in THIS same place? stay put. Otherwise walk over and then settle.
     const sameSeat = old && old.kind==='work' && old.seated &&
-                     old.deskX===slot.x && old.deskY===slot.y;
+                     old.deskX===px_ && old.deskY===py_;
     const emerging = !old && emergeFrom.has(a.id);   // just resurfaced -> wade in from the ocean
     const person = Object.assign(old||{}, {
       id:a.id, agent:a, kind:'work',
       // keep current position so a kitchen->desk move animates as a walk
-      x: old? old.x : (emerging? SEA.x : slot.x), y: old? old.y : (emerging? SEA.y : slot.y),
-      deskX:slot.x, deskY:slot.y, vx:0, vy:0,
+      x: old? old.x : (emerging? SEA.x : px_), y: old? old.y : (emerging? SEA.y : py_),
+      deskX:px_, deskY:py_, vx:0, vy:0,
       seated: old ? !!sameSeat : (emerging? false : true),   // emergers walk up from the water
       seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
+      ovf: ovf ? ovf.kind : null,        // 'table' | 'floor' | null(=real desk)
+      ovfDir: ovf ? ovf.dir : 1,
+      ovfLapX: ovf ? ovf.lx : 0,
     });
     if(emerging) emergeFrom.delete(a.id);
-    slot.worker = person;
+    if(slot) slot.worker = person;       // only real desks own a pod
     next.push(person);
   });
 
@@ -3839,6 +3919,84 @@ function drawBeachSitter(p, t){
   drawHairAcc(x, y-24, f); drawFace(x, y-24, f, true);        // sunglasses ON (beach only)
 }
 
+// ---- OVERFLOW WORKERS: no desk was free, so they work from wherever they can ----------
+// Both poses are built around (p.x,p.y) with the same anatomy/proportions as
+// drawBeachSitter so the crowd stays visually consistent, and both are drawn from the
+// drawList (NOT the desk-pod pass), so they z-sort against desks, the cat and the dog.
+// `selfActive` mirrors drawDeskPod: the laptop screen only animates while the agent's own
+// turn is in progress, and freezes on a dim standby colour when it's merely waiting on a
+// subagent -- otherwise an idle worker looks busier than a desk worker in the same state.
+function laptopScreen(lx, ly, t, selfActive, seed){
+  px(lx, ly, 18, 12, PAL.monitorLip);
+  if(selfActive){
+    const tints=['#7fd6a2','#6fc7f0','#e9d27a','#c9a2f0'];
+    for(let r=0;r<4;r++){
+      const w = 3 + (((Math.floor(t*0.25) + seed + r*3) % 5) * 3);   // scrolling "code" rows
+      px(lx+2, ly+2+r*2, w, 1, tints[(r+seed)%4]);
+    }
+  } else {
+    px(lx+1, ly+1, 16, 8, '#586a72');                               // dim standby screen
+  }
+  px(lx-1, ly+11, 20, 3, PAL.metal);                                // keyboard deck
+}
+
+// sitting cross-legged on the office floor, laptop on the lap
+function drawFloorWorker(p, t){
+  const x=Math.round(p.x), y=Math.round(p.y);
+  const f=p.feat||featuresFor(p.id||'x');
+  const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
+  const active = !!(p.agent && p.agent.self_active);
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x,y+7,14,4,0,0,Math.PI*2); ctx.fill();
+  // crossed legs: two folded shins meeting in front, knees out to the sides
+  ro(x-13, y-1, 12, 6, pants); ro(x+1, y-1, 12, 6, pants);
+  px(x-13,y-1,12,1,shade(pants,.18)); px(x+1,y-1,12,1,shade(pants,.18));
+  px(x-6, y+3, 12, 3, shade(pants,-.16));                    // ankles crossed under
+  px(x-14, y+1, 4, 4, shoe); px(x+10, y+1, 4, 4, shoe);
+  // torso (sits lower than the beach pose -- they're on the floor, not propped up)
+  ro(x-8, y-12, 16, 13, sh);
+  px(x-8,y-12,16,2,shade(sh,.30)); px(x+5,y-11,3,11,shade(sh,-.20));
+  px(x-2,y-12,4,2,shade(sh,-.28));                           // collar
+  torsoDetail(x, y-12, 8, 13, sh, f);
+  // laptop resting on the lap, both arms reaching down to it
+  laptopScreen(x-9, y-6, t, active, p.seed||0);
+  ro(x-12, y-9, 4, 7, sh); ro(x+8, y-9, 4, 7, sh);
+  px(x-12, y-3, 4, 2, sk); px(x+8, y-3, 4, 2, sk);           // hands on the keyboard
+  // neck + head
+  px(x-3, y-16, 6, 4, sk);
+  ro(x-7, y-29, 14, 15, sk); px(x-7,y-15,14,1,'rgba(0,0,0,.10)');
+  drawHairAcc(x, y-27, f); drawFace(x, y-27, f, false);
+}
+
+// sitting at the kitchen lounge table, laptop on the table in front of them
+function drawTableWorker(p, t){
+  const x=Math.round(p.x), y=Math.round(p.y);
+  const f=p.feat||featuresFor(p.id||'x');
+  const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
+  const active = !!(p.agent && p.agent.self_active);
+  const dir = p.ovfDir || 1;
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x,y+9,12,4,0,0,Math.PI*2); ctx.fill();
+  // seated on a pouf: thighs forward, shins hanging down
+  ro(x-7, y-1, 14, 6, pants); px(x-7,y-1,14,1,shade(pants,.18));
+  px(x-6, y+5, 4, 5, pants); px(x+2, y+5, 4, 5, pants);
+  px(x-7, y+9, 5, 3, shoe);  px(x+2, y+9, 5, 3, shoe);
+  // torso
+  ro(x-8, y-13, 16, 13, sh);
+  px(x-8,y-13,16,2,shade(sh,.30)); px(x+5,y-12,3,11,shade(sh,-.20));
+  px(x-2,y-13,4,2,shade(sh,-.28));
+  torsoDetail(x, y-13, 8, 13, sh, f);
+  // the laptop sits on the TABLE beside them (lx is the seat's own table-side offset), and
+  // the near arm reaches across to it -- mirrored by dir so both seats read correctly.
+  const lx = (p.ovfLapX || x) ;
+  laptopScreen(lx, y-8, t, active, p.seed||0);
+  ro(x + (dir>0 ? -12 : 8), y-10, 4, 8, sh);
+  px(x + (dir>0 ? -12 : 8), y-3, 4, 2, sk);                  // hand on the keys
+  ro(x + (dir>0 ? 8 : -12), y-10, 4, 7, sh);                 // other arm resting
+  // neck + head
+  px(x-3, y-17, 6, 4, sk);
+  ro(x-7, y-30, 14, 15, sk); px(x-7,y-16,14,1,'rgba(0,0,0,.10)');
+  drawHairAcc(x, y-28, f); drawFace(x, y-28, f, false);
+}
+
 // the beach easter egg's demise: an agent slipping under the waves. st = 0..1 sink
 // progress. Drawn inside the same scaleAbout(p.x,p.y,SC) transform as the other sprites,
 // so we build around (p.x,p.y) exactly like drawBeachSitter. X_X eyes, a last flail of
@@ -4560,7 +4718,9 @@ function render(t){
   // everyone currently standing/walking (kitchen agents + workers still walking in),
   // interleaved with the ambient dog/cat so overlaps sort correctly by y (painter's).
   const drawList=[];
-  people.filter(p=> p.kind!=='work' || !p.seated).forEach(p=> drawList.push({y:p.y, p}));
+  // seated DESK workers are drawn by the desk-pod pass; everyone else goes in the z-sorted
+  // list -- including seated OVERFLOW workers, who have no pod and would otherwise vanish.
+  people.filter(p=> p.kind!=='work' || !p.seated || p.ovf).forEach(p=> drawList.push({y:p.y, p}));
   if(amb.dog) drawList.push({y:amb.dog.y, dog:amb.dog});
   if(amb.cat) drawList.push({y:amb.cat.y, cat:amb.cat});
   drawList.sort((a,b)=>a.y-b.y);
@@ -4569,11 +4729,17 @@ function render(t){
       // beach agents sit (with shades + cocktail) once settled; still walk in standing
       if(e.p.mode==='drown' && e.p.sinking) drawDrowning(e.p, e.p.sinkT||0);
       else if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t);
+      // overflow workers only take their seated pose once they've actually arrived --
+      // while walking over they use the normal standing sprite, like everyone else.
+      else if(e.p.ovf==='floor' && e.p.seated) drawFloorWorker(e.p,t);
+      else if(e.p.ovf==='table' && e.p.seated) drawTableWorker(e.p,t);
       else drawStanding(e.p,t);
       ctx.restore();
       // a WAITING (kitchen) agent's open background shells float above its head, so a running
       // shell (e.g. a dev server) stays visible after the chat leaves the desk for the kitchen.
-      if(e.p.kind==='wait' && e.p.agent && e.p.agent.shells && e.p.agent.shells.length){
+      // ...and so do OVERFLOW workers', who have no desk pod to hang them off, so without
+      // this their running shells would be invisible information loss.
+      if((e.p.kind==='wait' || e.p.ovf) && e.p.agent && e.p.agent.shells && e.p.agent.shells.length){
         const sh=e.p.agent.shells, m=Math.min(sh.length,3);
         const base = Math.round(e.p.x - ((m-1)*22+17)/2);   // centre the row over the head
         ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
