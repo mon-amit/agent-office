@@ -2322,6 +2322,19 @@ let whipFx = [];            // whip-crack particles: one lash line + shock strea
 // --- water cooler: click the office cooler and it squirts an arc of water ---
 let waterFx = [];           // water droplet particles from the cooler spout (capped, auto-expire)
 let coolerHit = null;       // {x0,y0,x1,y1,sx,sy} cooler click rect + spout origin (set each frame)
+// --- FRIDGE: click the kitchen fridge to open it; a grocery delivery restocks it daily ---
+let fridgeHit = null;       // {x0,y0,x1,y1} fridge click rect (set each frame)
+let fridgeOpen = false;     // door state (click toggles); auto-closes after FRIDGE_AUTOCLOSE_MS
+let fridgeOpenedAt = 0;     // performance.now() when it was opened, for the auto-close
+const FRIDGE_AUTOCLOSE_MS = 9000;
+// One grocery delivery per calendar day. The crate is dropped by the fridge, sits for a
+// moment, then its contents "go in" and the shelves are full again. Keyed by local date
+// so it survives reloads and fires once per real day, not once per page load.
+let fridgeStockDay = localStorage.getItem('office_fridge_day') || '';
+let fridgeStocked = (localStorage.getItem('office_fridge_stocked') === '1');
+let delivery = null;        // {start, phase} while the crate is being delivered/unpacked
+const DELIVERY_CRATE_MS = 4200;   // crate visible before it is unpacked into the fridge
+function todayKey(){ const d=new Date(); return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate(); }
 // --- Godzilla: stomps across the window every round hour (or on a wall-clock click) ---
 let clockHit = null;        // {x0,y0,x1,y1} wall-clock click rect (set each frame)
 let godzilla = { active:false, t:0 };   // t = 0..1 progress walking across the window
@@ -3247,6 +3260,53 @@ function drawOfficeProps(){
   bigPlant(34, lastDeskY+44);
 }
 
+// ---- daily grocery delivery: a crate is set down beside the fridge, sits a moment, then
+// its contents "go in" and the shelves read as stocked for the rest of the day ----
+function drawDelivery(fx, fy, fw, fh){
+  if(!delivery) return;
+  const el = performance.now() - delivery.start;
+  if(el < 0) return;                                     // scheduled but not arrived yet
+  const gy = fy + fh;                                    // floor line at the fridge's base
+  const cx = fx + fw + 12;
+  // slides in from the left over the first 500ms, then rests
+  const slide = Math.min(1, el/500);
+  const x = cx - (1-slide)*26;
+  const fade = el > DELIVERY_CRATE_MS - 500 ? Math.max(0, (DELIVERY_CRATE_MS - el)/500) : 1;
+  ctx.save(); ctx.globalAlpha = fade;
+  // cardboard crate
+  px(x-9, gy-13, 18, 13, '#b07a42'); px(x-9, gy-13, 18, 2, '#c8925a');
+  px(x-9, gy-8, 18, 1, '#8f5f30');                       // tape seam
+  px(x-2, gy-13, 4, 13, '#9a6a38');                      // vertical tape
+  // groceries poking out of the top
+  px(x-6, gy-18, 4, 6, '#5aa04a'); px(x-1, gy-19, 3, 7, '#e3b021'); px(x+3, gy-17, 4, 5, '#d24b6a');
+  // a little "delivered" tag
+  ctx.fillStyle=PAL.ink; ctx.font='5px "Press Start 2P", monospace';
+  ctx.fillText('groceries', x-16, gy-22);
+  ctx.restore();
+}
+
+// advance the once-per-day grocery delivery state machine; called from tick()
+function updateDelivery(now){
+  const day = todayKey();
+  if(fridgeStockDay !== day){
+    // new calendar day -> today's delivery has not happened yet
+    fridgeStockDay = day; fridgeStocked = false; delivery = null;
+    localStorage.setItem('office_fridge_day', day);
+    localStorage.setItem('office_fridge_stocked', '0');
+    // schedule the crate to show up shortly after we notice the new day
+    delivery = { start: now + 1500 };
+  }
+  if(delivery && now >= delivery.start + DELIVERY_CRATE_MS){
+    delivery = null;                                     // crate unpacked -> shelves stocked
+    if(!fridgeStocked){
+      fridgeStocked = true;
+      localStorage.setItem('office_fridge_stocked', '1');
+      toast('groceries delivered 🛒');
+    }
+  }
+  if(fridgeOpen && now - fridgeOpenedAt > FRIDGE_AUTOCLOSE_MS) fridgeOpen = false;
+}
+
 function drawKitchenProps(){
   const L=layout(), k=L.kitchen, T=L.kitchenTop;
   // back wall band for mounting decor + counters
@@ -3258,16 +3318,52 @@ function drawKitchenProps(){
   }
   drawBeachFloor();   // sand + water fill the right band (under the back-wall props)
 
-  // ---- tall fridge (far left): freezer/fridge split, handles, magnets, photo ----
+  // ---- tall fridge (far left): freezer/fridge split, handles, magnets, photo.
+  // Clickable: opens to reveal lit shelves whose contents depend on whether today's
+  // grocery delivery has arrived yet (see delivery/fridgeStocked). ----
   const fx=8, fy=T+14, fw=30, fh=74; ro(fx,fy,fw,fh,PAL.fridge);
   px(fx,fy,fw,3,PAL.fridgeDk); px(fx+1,fy+1,fw-2,1,shade(PAL.fridge,.30));   // top + sheen
-  px(fx,fy+30,fw,3,PAL.fridgeDk);                                            // freezer/fridge door split
-  px(fx+fw-6,fy+7,3,17,PAL.metalDk); px(fx+fw-6,fy+38,3,28,PAL.metalDk);     // two vertical handles
-  // magnets + a photo + a sticky note
-  px(fx+5,fy+40,5,4,PAL.red); px(fx+12,fy+41,4,4,PAL.yellow); px(fx+18,fy+39,4,4,PAL.mugB);
-  px(fx+5,fy+48,7,7,PAL.paper); px(fx+5,fy+48,7,1,'#e6e6ec'); px(fx+6,fy+50,5,3,'#9fd9f0'); // photo
-  px(fx+15,fy+49,9,6,'#fff3b0'); px(fx+15,fy+49,9,1,shade('#fff3b0',-.2));                  // sticky note
+  fridgeHit = { x0:fx-2, y0:fy-2, x1:fx+fw+2, y1:fy+fh+2 };                  // click rect
+  if(fridgeOpen){
+    // ---- OPEN: dark lit cavity + shelves + food, with the door swung out to the left ----
+    const iy=fy+30, ih=fh-30;                                                 // fridge compartment (below freezer)
+    px(fx,iy,fw,ih,'#243040');                                                // cold dark interior
+    px(fx+2,iy+1,fw-4,ih-2,'#2f3f52');
+    px(fx+2,iy+1,fw-4,2,'#cfe6f5');                                           // interior light spill at the top
+    const shelves=[iy+11, iy+24, iy+37];
+    for(const sy of shelves) px(fx+2,sy,fw-4,1,'#7f8fa2');                    // wire shelves
+    if(fridgeStocked){
+      // full shelves: bottles, a carton, leftovers, fruit
+      px(fx+4,shelves[0]-8,4,8,'#6fa8d8');  px(fx+4,shelves[0]-9,4,1,'#bcd9ef');   // water bottle
+      px(fx+9,shelves[0]-7,4,7,'#e3b021');  px(fx+9,shelves[0]-8,4,1,'#f6d97a');   // juice
+      px(fx+15,shelves[0]-9,6,9,'#eef2f6'); px(fx+15,shelves[0]-9,6,2,'#c9d3dd');  // milk carton
+      px(fx+23,shelves[0]-6,4,6,'#d2452f');                                        // hot sauce
+      px(fx+4,shelves[1]-7,9,7,'#c98a3a');  px(fx+4,shelves[1]-7,9,1,'#e0a558');   // leftovers box
+      px(fx+15,shelves[1]-5,5,5,'#5aa04a');                                        // greens
+      px(fx+22,shelves[1]-6,5,6,'#e07a2f');                                        // orange juice
+      px(fx+5,shelves[2]-5,4,4,'#d24b6a');  px(fx+11,shelves[2]-5,4,4,'#5aa04a');  // fruit
+      px(fx+17,shelves[2]-6,8,6,'#e8e8e8'); px(fx+17,shelves[2]-6,8,1,'#ffffff');  // yoghurt tub
+    } else {
+      // pre-delivery: nearly bare -- one sad condiment and a lone egg
+      px(fx+5,shelves[1]-6,4,6,'#8a9a5b');
+      px(fx+20,shelves[2]-4,3,4,'#f0e6d2');
+      ctx.fillStyle='rgba(200,215,230,.55)'; ctx.font='5px "Press Start 2P", monospace';
+      ctx.fillText('empty', fx+4, shelves[0]-2);
+    }
+    // the swung-open door, hinged on the fridge's left edge, drawn edge-on to its left
+    px(fx-9,iy,9,ih,shade(PAL.fridge,-.10)); px(fx-9,iy,9,2,shade(PAL.fridge,.24));
+    px(fx-9,iy,2,ih,PAL.fridgeDk);                                            // door outer face
+    for(const dy of [iy+8, iy+22, iy+34]) px(fx-7,dy,5,3,'#93a3b5');          // door-shelf rails
+  } else {
+    px(fx,fy+30,fw,3,PAL.fridgeDk);                                          // freezer/fridge door split
+    px(fx+fw-6,fy+7,3,17,PAL.metalDk); px(fx+fw-6,fy+38,3,28,PAL.metalDk);   // two vertical handles
+    // magnets + a photo + a sticky note
+    px(fx+5,fy+40,5,4,PAL.red); px(fx+12,fy+41,4,4,PAL.yellow); px(fx+18,fy+39,4,4,PAL.mugB);
+    px(fx+5,fy+48,7,7,PAL.paper); px(fx+5,fy+48,7,1,'#e6e6ec'); px(fx+6,fy+50,5,3,'#9fd9f0'); // photo
+    px(fx+15,fy+49,9,6,'#fff3b0'); px(fx+15,fy+49,9,1,shade('#fff3b0',-.2));                  // sticky note
+  }
   smallPlant(fx+9, fy-9);                                                    // little plant on top
+  drawDelivery(fx, fy, fw, fh);                                              // today's grocery crate, if it's arriving
 
   // ---- kitchen counter (center-back): solid countertop, cabinetry, inset sink,
   // espresso bar + a wall shelf with jars/mugs ----
@@ -4436,6 +4532,7 @@ function tick(now){
     if(n){ saveDrowned(); saveFinished(); }
   }
   updateAmbient(now, dt);
+  updateDelivery(now);
   render(tCount);
   requestAnimationFrame(tick);
 }
@@ -5427,7 +5524,7 @@ cv.addEventListener('mousemove', e=>{
   const vs=pickVend(m.x,m.y);
   if(vs){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
   // clickable props -- pointer cursor only, no tooltip (discover them by clicking)
-  if(inHit(coolerHit,m.x,m.y) || inHit(clockHit,m.x,m.y)){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
+  if(inHit(coolerHit,m.x,m.y) || inHit(clockHit,m.x,m.y) || inHit(fridgeHit,m.x,m.y)){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
   // a workflow tent? (takes precedence over helpers)
   const wf=pickWorkflow(m.x,m.y);
   if(wf){
@@ -5533,6 +5630,10 @@ cv.addEventListener('click', e=>{
   const m=toCanvas(e);
   if(inHit(clockHit,m.x,m.y)){ triggerGodzilla(); toast('🦖'); return; }   // clock -> summon Godzilla (test hook)
   if(inHit(coolerHit,m.x,m.y)){ squirtCooler(); return; }                  // cooler -> squirt water
+  if(inHit(fridgeHit,m.x,m.y)){                                            // fridge -> open/close the door
+    fridgeOpen=!fridgeOpen; fridgeOpenedAt=performance.now();
+    if(fridgeOpen) toast(fridgeStocked ? 'fridge: fully stocked' : 'fridge: pretty empty…');
+    return; }
   const pet=pickPet(m.x,m.y);                 // pet the dog/cat before opening any worker
   if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
   const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray
