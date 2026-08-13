@@ -5963,6 +5963,13 @@ function detectFinishes(list){
   prevStatus=cur;
 }
 refresh(); setInterval(refresh, 4000);
+// browsers throttle background/hidden tabs (setInterval slows way down, rAF can pause
+// entirely) -- whatever was on screen the moment focus was lost just sits there stale
+// until the tab catches up on its own. Force an immediate resync the instant the tab
+// becomes visible/focused again, instead of waiting on throttled timers to notice.
+function resyncNow(){ refresh(); last=performance.now(); requestAnimationFrame(tick); }
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') resyncNow(); });
+window.addEventListener('focus', resyncNow);
 // ---- dev hot-reload: in --watch mode the server re-execs on file change, minting a
 // fresh token; the tab reloads itself when it notices. No-op unless --watch is on. ----
 (async function initWatch(){
