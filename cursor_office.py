@@ -2466,8 +2466,20 @@ function rebuild(){
   // when the "hide scheduled" filter is on, courier (scheduled) agents don't get a
   // desk or kitchen spot -- they walk off-screen instead (handled at the end).
   const active = hideScheduled ? agents.filter(a=>!a.scheduled) : agents;
-  // agents marked "finished" go to the beach regardless of working/waiting status;
-  // everyone else is placed at desks (working) or the kitchen (waiting) as before.
+  // An agent parked on the beach that has STARTED WORKING AGAIN is, by definition, not
+  // finished. Leaving it on the sand while its own card reads "working" is a flat
+  // contradiction, and it is sticky: finishedIds is persisted in localStorage and the
+  // sweep-kitchen button adds the WHOLE kitchen at once, so one click could permanently
+  // beach a dozen agents that later went back to work. Auto-return them, mirroring how a
+  // drowned agent resurfaces once its transcript advances again. (A merely WAITING agent
+  // stays parked -- sending it there was a deliberate choice and nothing contradicts it.)
+  let _unbeached = false;
+  for(const a of active){
+    if(a.status==='working' && finishedIds.has(a.id)){ finishedIds.delete(a.id); _unbeached = true; }
+  }
+  if(_unbeached) saveFinished();
+  // agents still marked "finished" go to the beach; everyone else is placed at desks
+  // (working) or the kitchen (waiting) as before.
   const beachers = active.filter(a=>finishedIds.has(a.id));
   const rest = active.filter(a=>!finishedIds.has(a.id));
   const workers = rest.filter(a=>a.status==='working');
