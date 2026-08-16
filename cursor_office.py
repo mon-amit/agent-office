@@ -5116,10 +5116,28 @@ function startAgentPet(now){
 
 // ---- 1) DOG walks across the OFFICE floor and exits ----
 const DOG_BREEDS=['dachshund','husky','retriever'];
+// per-breed palette + silhouette size, extracted from drawDog's per-breed blocks below,
+// so the new generic poses (sit/flop/rear) can render any breed in the right colours
+// without duplicating each breed's construction three times over.
+function dogPalette(breed){
+  if(breed==='dachshund') return {c:'#8a5a2b',cd:'#6b431d',ch:'#a3743f',wht:'#8a5a2b',ear:'#5a3717',nose:'#241c2b',bw:42,bh:9,leg:6};
+  if(breed==='husky')     return {c:'#9aa3ab',cd:'#6f7780',ch:'#cfd5da',wht:'#f3f5f7',ear:'#5b636b',nose:'#241c2b',bw:30,bh:12,leg:9};
+  return                         {c:'#e0a84a',cd:'#bd8730',ch:'#f0c878',wht:'#e0a84a',ear:'#bd8730',nose:'#2a2018',bw:32,bh:13,leg:9};
+}
+// a real daily routine for the dog too, mirroring the cat's proven FSM shape (weighted
+// behavior + duration, walk-to-target then hold-a-pose) while staying clearly dog-like:
+// sniff/scent-track, zoomies, play bow, beg, fetch, lean-for-contact, follow, and an
+// alert bark at the plane/Godzilla -- plus a dog-cat encounter when both are on screen.
+const DOG_BEHAVIOR_WEIGHTS = {sniff:3, zoomies:2, beg:1.4, fetch:1.2, lean:1.4, follow:1};
+const DOG_BEHAVIOR_DUR = {sniff:5500, zoomies:3400, bow:1400, beg:5000, fetch:6500, lean:4000, follow:6000, alert:3200};
+const DOG_BED = [300, -24];               // [x, yOffsetFromKitchenTop] -> same safe lane the dog already crosses in
+function dogBedSpot(){ const T=layout().kitchenTop; return [DOG_BED[0], T+DOG_BED[1]]; }
+
 function startDog(now){
   const L=layout();
   const dir = Math.random()<0.5 ? 1 : -1;            // 1: L->R, -1: R->L
   const breed = DOG_BREEDS[(Math.random()*DOG_BREEDS.length)|0];
+  const visit = Math.random()<0.55 && window.__dogVisitChance!==0;   // most visits linger; some just cross, unchanged
   amb.dog = {
     breed, dir,
     x: dir>0 ? -36 : W+36,
@@ -5128,7 +5146,136 @@ function startDog(now){
     // random eating cycle: most crossings, the dog detours to its bowl on the way
     willEat: Math.random()<0.6, ateDone:false, eating:false, eatUntil:0,
     willDrink: Math.random()<0.5, drankDone:false,
+    // visit-mode fields -- present on EVERY dog (cross included) so petDog() never
+    // touches an undefined field regardless of mode.
+    mode: visit ? 'visit' : 'cross',
+    state:'in', pose:'walk', behavior:null, walking:false,
+    // entry landing spot for a visit (reuses the cat's own established-safe floor
+    // spots, so it can never land in furniture); irrelevant/unused in cross mode.
+    tx: visit ? CAT_SPOTS[(Math.random()*CAT_SPOTS.length)|0][0] : 0,
+    ty: visit ? CAT_SPOTS[(Math.random()*CAT_SPOTS.length)|0][1] : 0,
+    bStart:0, bUntil:0, roamNextAt:0,
+    cyclesLeft: 4 + ((Math.random()*3)|0),
+    metCat:false, ballHeld:false, alertHandledFor:null,
+    sleepUntil:0, circleUntil:0,
   };
+}
+
+// choose the dog's next behavior (or head to bed once its cycles run out). Reuses the
+// cat's own established-safe floor spots for sniff targets -- CAT_SPOTS is already
+// "clear of furniture", so the dog gets that guarantee for free instead of re-solving it.
+function pickDogBehavior(d, now){
+  if(d.encounter) return;                          // the encounter owns the dog for now
+  if(d.cyclesLeft<=0){
+    d.behavior=null; d.pose='walk'; const bed=dogBedSpot();
+    d.tx=bed[0]; d.ty=bed[1]; d.state='bedwalk'; return;
+  }
+  d.cyclesLeft--;
+  // force a dog-cat encounter once per visit, the moment the cat is actually out
+  if(!d.metCat && amb.cat && (amb.cat.state==='active'||amb.cat.state==='sleep') && !amb.cat.encounter){
+    d.metCat=true; d.behavior='meetcat'; d.encPhase='approach';
+    d.tx = amb.cat.x + (d.x<amb.cat.x?-26:26); d.ty = amb.cat.y;
+    d.walking=true; d.spd=90; amb.cat.encounter=true;
+    return;
+  }
+  let bh = weightedPick(DOG_BEHAVIOR_WEIGHTS);
+  const seatedReal = people.filter(p=>p.kind==='work' && p.seated && !p.ovf);
+  if((bh==='beg') && !seatedReal.length && !(fridgeOpen||delivery)) bh='sniff';
+  if((bh==='lean'||bh==='follow') && !people.length) bh='sniff';
+  d.behavior=bh; d.pose='walk';
+  d.bStart=now; d.bUntil=now+(DOG_BEHAVIOR_DUR[bh]||4000); d.walking=true; d.roamNextAt=0;
+  switch(bh){
+    case 'sniff': d.spd=55; break;                                       // slow, deliberate zigzag (set per-tick below)
+    case 'zoomies': { const s=CAT_SPOTS[(Math.random()*CAT_SPOTS.length)|0]; d.tx=s[0]; d.ty=s[1]; d.spd=220; break; }
+    case 'beg': {
+      if(fridgeOpen||delivery){ d.tx=48; d.ty=layout().kitchenTop+96; }   // beg at the fridge instead, when there's a reason to
+      else { const p=seatedReal[(Math.random()*seatedReal.length)|0]; d.tx=p.deskX+18; d.ty=p.deskY+14; }
+      d.spd=130; break;
+    }
+    case 'fetch': { const s=CAT_SPOTS[(Math.random()*CAT_SPOTS.length)|0]; d.tx=s[0]; d.ty=s[1]; d.spd=150; d.ballHeld=true; break; }
+    case 'lean': case 'follow': {
+      const cands = people.filter(p=> !(p.kind==='work'&&!p.seated));
+      const p = cands.length ? cands[(Math.random()*cands.length)|0] : null;
+      if(p){ const seatedT=p.kind==='work'&&p.seated; d.tx=(seatedT?p.deskX:p.x)+(Math.random()<0.5?-18:18); d.ty=(seatedT?p.deskY:p.y)+8; }
+      else { d.tx=d.x; d.ty=d.y; }
+      d.spd = bh==='follow' ? 100 : 110; break;
+    }
+  }
+}
+
+// advance the dog's current visit-mode behavior; mirrors updateCatBehavior's shape.
+function updateDogBehavior(d, now, sec){
+  if(d.behavior==='meetcat'){ updateDogCatMeet(d, now, sec); return; }
+  if(d.behavior==='sniff' && now>=d.roamNextAt){
+    const base = CAT_SPOTS[(Math.random()*CAT_SPOTS.length)|0];
+    d.tx = Math.max(50, Math.min(500, base[0]+(Math.random()*50-25)));
+    d.ty = Math.max(455, Math.min(556, base[1]+(Math.random()*30-15)));
+    d.roamNextAt = now + 900 + Math.random()*500;
+  }
+  if(d.walking){
+    const dx=d.tx-d.x, dy=d.ty-d.y, dist=Math.hypot(dx,dy);
+    if(dist<=d.spd*sec+1 && d.behavior!=='sniff' && d.behavior!=='zoomies'){
+      d.x=d.tx; d.y=d.ty; d.walking=false;
+      if(d.behavior==='zoomies'){ d.pose='bow'; }                        // slam to a stop in a play bow
+    } else if(dist>0.5){
+      const step=Math.min(dist, d.spd*sec);
+      d.x+=dx/dist*step; d.y+=dy/dist*step;
+      if(Math.abs(dx)>2) d.dir = dx>=0?1:-1;                             // dead zone: no sub-pixel mirror-flicker
+    }
+  }
+  if(now>=d.bUntil){
+    d.ballHeld=false;
+    pickDogBehavior(d, now);
+  }
+}
+
+// alert bark: an EDGE-triggered reaction to the plane or Godzilla passing, not a level --
+// re-checking a level would re-fire on every tick it stays true and burn cyclesLeft fast.
+function maybeDogAlert(d, now){
+  if(d.mode!=='visit' || d.behavior==='meetcat' || d.encounter) return;
+  const trigger = (amb.plane ? 'plane' : (godzilla.active ? 'godzilla' : null));
+  if(!trigger){ d.alertHandledFor=null; return; }
+  if(d.alertHandledFor===trigger) return;           // already barked at this specific pass
+  d.alertHandledFor = trigger;
+  d.behavior='alert'; d.pose='rear'; d.walking=false;
+  d.bStart=now; d.bUntil=now+DOG_BEHAVIOR_DUR.alert;
+}
+
+// ---- dog meets cat: a short, safe, ALWAYS-terminating encounter -----------------------
+function updateDogCatMeet(d, now, sec){
+  const c = amb.cat;
+  if(!c){ d.behavior=null; pickDogBehavior(d, now); return; }            // cat vanished mid-encounter -> bail safely
+  if(d.encPhase==='approach'){
+    const dx=d.tx-d.x, dy=d.ty-d.y, dist=Math.hypot(dx,dy);
+    if(dist<=60*sec+1){ d.x=d.tx; d.y=d.ty; d.encPhase='pause'; d.encUntil=now+1200; }
+    else { const step=Math.min(dist,60*sec); d.x+=dx/dist*step; d.y+=dy/dist*step; if(Math.abs(dx)>2) d.dir=dx>=0?1:-1; }
+    d.pose='walk';
+  } else if(d.encPhase==='pause'){
+    d.pose='sniffclose';
+    if(now>=d.encUntil){
+      const awake = c.state==='active';
+      const roll = Math.random();
+      let outcome;
+      if(!awake) outcome = roll<0.6 ? 'ignore' : 'swat';
+      else outcome = roll<0.40 ? 'play' : roll<0.65 ? 'ignore' : roll<0.85 ? 'swat' : roll<0.95 ? 'chase' : 'rub';
+      d.encPhase='resolve'; d.encOutcome=outcome; d.encUntil=now + (outcome==='chase'?4000:2200);
+      if(outcome==='swat'){ d.react={type:'violence', start:now, until:now+800}; d.tx=d.x+(d.x<c.x?-14:14); d.ty=d.y; d.walking=true; d.spd=90; }
+      else if(outcome==='play'){ d.pose='bow'; const s=CAT_SPOTS[(Math.random()*CAT_SPOTS.length)|0]; c.behavior='roam'; c.walking=true; c.bUntil=now+2200; c.roamNextAt=0; }
+      else if(outcome==='chase' && awake){ const spots=catStationSpots(); const s=spots.perches[(Math.random()*spots.perches.length)|0]; c.behavior='perch'; c.tx=s[0]; c.ty=s[1]; c.walking=true; c.bUntil=now+4000; d.pose='sit'; }
+      else if(outcome==='rub'){ c.behavior='rub'; c.tx=d.x; c.ty=d.y; c.walking=false; c.bUntil=now+2200; d.pose='walk'; }
+      else { d.pose='walk'; }                                            // ignore
+    }
+  } else { // resolve
+    if(d.encOutcome==='swat' && d.walking){
+      const dx=d.tx-d.x, dist=Math.abs(dx);
+      if(dist>0.5){ const step=Math.min(dist,90*sec); d.x+=Math.sign(dx)*step; }
+      else d.walking=false;
+    }
+    if(now>=d.encUntil){
+      c.encounter=false; d.behavior=null; d.encPhase=null;
+      pickDogBehavior(d, now);
+    }
+  }
 }
 
 // ---- 2) CAT: a real Bengal, with a real daily routine ----
@@ -5320,17 +5467,48 @@ function updateAmbient(now, dt){
   if(now>=nextEventAt){ fireRandomEvent(now); scheduleNextEvent(now); }
   const sec=dt/1000;
   if(amb.dog){ const d=amb.dog;
-    if(d.eating){
-      if(now>=d.eatUntil) d.eating=false;                          // done at the bowl -> resume crossing
-    } else if(!(d.react && now<d.react.until)){                    // pause walking mid-pet too
-      const foodX=DOG_BOWL_X, waterX=DOG_BOWL_X+13;
-      const passedFood  = d.dir>0 ? d.x>=foodX-3  : d.x<=foodX+3;
-      const passedWater = d.dir>0 ? d.x>=waterX-3 : d.x<=waterX+3;
-      if(d.willEat && !d.ateDone && passedFood){ d.eating=true; d.ateDone=true; d.eatUntil=now+2200; d.x=foodX; }
-      else if(d.willDrink && !d.drankDone && passedWater){ d.eating=true; d.drankDone=true; d.eatUntil=now+1800; d.x=waterX; }
-      else d.x += d.dir*d.spd*sec;
+    if(d.mode==='cross'){
+      // ORIGINAL crossing logic, byte-for-byte unchanged -- the zero-regression path.
+      if(d.eating){
+        if(now>=d.eatUntil) d.eating=false;
+      } else if(!(d.react && now<d.react.until)){
+        const foodX=DOG_BOWL_X, waterX=DOG_BOWL_X+13;
+        const passedFood  = d.dir>0 ? d.x>=foodX-3  : d.x<=foodX+3;
+        const passedWater = d.dir>0 ? d.x>=waterX-3 : d.x<=waterX+3;
+        if(d.willEat && !d.ateDone && passedFood){ d.eating=true; d.ateDone=true; d.eatUntil=now+2200; d.x=foodX; }
+        else if(d.willDrink && !d.drankDone && passedWater){ d.eating=true; d.drankDone=true; d.eatUntil=now+1800; d.x=waterX; }
+        else d.x += d.dir*d.spd*sec;
+      }
+      if((d.dir>0 && d.x>W+44) || (d.dir<0 && d.x<-44)) amb.dog=null;
+    } else {
+      // VISIT mode: in -> active (behavior FSM) -> bedwalk -> sleep -> out. The 'out'
+      // walk deliberately uses the SAME unbounded despawn check as cross mode (no zone
+      // clamp), and starts from the bed's safe office-lane y -- never the deeper kitchen
+      // floor -- so it can never wander into the beach/ocean on its way out.
+      if(d.state==='in'){
+        const dx=d.tx-d.x, dy=d.ty-d.y, dist=Math.hypot(dx,dy);
+        if(dist<=d.spd*sec+1){ d.x=d.tx; d.y=d.ty; d.state='active'; pickDogBehavior(d, now); }
+        else { const step=Math.min(dist,d.spd*sec); d.x+=dx/dist*step; d.y+=dy/dist*step; if(Math.abs(dx)>2) d.dir=dx>=0?1:-1; }
+      } else if(d.state==='active'){
+        maybeDogAlert(d, now);
+        updateDogBehavior(d, now, sec);
+      } else if(d.state==='bedwalk'){
+        const dx=d.tx-d.x, dy=d.ty-d.y, dist=Math.hypot(dx,dy);
+        if(dist<=d.spd*sec+1){
+          d.x=d.tx; d.y=d.ty; d.circleUntil=now+2200; d.state='circle'; d.pose='walk';
+        } else { const step=Math.min(dist,d.spd*sec); d.x+=dx/dist*step; d.y+=dy/dist*step; if(Math.abs(dx)>2) d.dir=dx>=0?1:-1; }
+      } else if(d.state==='circle'){
+        d.pose='walk';                                    // fast facing-flip reads as turning circles in place
+        if(Math.floor(now/220)%2===0) d.dir=1; else d.dir=-1;
+        if(now>=d.circleUntil){ d.state='sleep'; d.pose='flop'; d.sleepUntil=now+(20000+Math.random()*25000); }
+      } else if(d.state==='sleep'){
+        if(now>=d.sleepUntil){ d.state='out'; d.pose='walk'; d.dir=(d.x<W/2)?-1:1; d.spd=118+Math.random()*26; }
+      } else { // out -- unclamped, same despawn rule as cross mode
+        d.x += d.dir*d.spd*sec;
+        if((d.dir>0 && d.x>W+44) || (d.dir<0 && d.x<-44)) amb.dog=null;
+      }
     }
-    if((d.dir>0 && d.x>W+44) || (d.dir<0 && d.x<-44)) amb.dog=null; }
+  }
   if(amb.cat){ const c=amb.cat;
     if(c.state==='in'){
       if(Math.abs(c.tx-c.x) <= c.spd*sec+0.5){ c.x=c.tx; c.y=c.ty; c.state='active'; pickCatBehavior(c, now); }
@@ -5342,7 +5520,9 @@ function updateAmbient(now, dt){
       if(d<=c.spd*sec+1){ c.x=c.tx; c.y=c.ty; c.state='sleep'; c.sleepUntil=now+c.napMs; }
       else { c.x+=dx/d*c.spd*sec; c.y+=dy/d*c.spd*sec; c.dir=dx>=0?1:-1; }
     } else if(c.state==='sleep'){
-      if(now>=c.sleepUntil){ c.state='out'; c.dir = (c.x < W/2) ? -1 : 1; }   // leave the nearer side
+      // guarded by !c.encounter: an asleep cat can be the target of a dog encounter
+      // (ignore/swat outcomes), and must not wake up and leave mid-encounter.
+      if(now>=c.sleepUntil && !c.encounter){ c.state='out'; c.dir = (c.x < W/2) ? -1 : 1; }   // leave the nearer side
     } else { // out
       c.x += c.dir*c.spd*sec;
       if((c.dir>0 && c.x>W+24) || (c.dir<0 && c.x<-24)) amb.cat=null;
@@ -5379,10 +5559,37 @@ function drawPlane(pl){
 }
 
 // DOG: three visually distinct breeds, side-on, facing its walk direction.
+// Bengal-style FIXED overlay anchors so a behavior's "prop" (tongue/ball/puffs) sits in
+// a consistent spot relative to the dog's own anchor, without needing each breed's exact
+// muzzle math -- close enough at this pixel scale, and zero risk to the tested breed art.
+function drawDogOverlay(d, t, pal){
+  const x=d.x, y=d.y, mx=x+pal.bw/2+16, my=y-14;    // approximate muzzle, any breed/dir
+  if(d.behavior==='zoomies'){
+    px(mx-2, my+4, 5, 3, '#e79ab0'); px(mx-2, my+7, 5, 2, '#d47a92');            // tongue flapping
+  }
+  if(d.ballHeld){
+    ctx.fillStyle='#d2452f'; ctx.beginPath(); ctx.ellipse(mx+2,my+2,3,3,0,0,Math.PI*2); ctx.fill();
+    px(mx+1,my+1,1,1,'#8a2418');                                                 // ball in mouth
+  }
+  if(d.behavior==='sniff' || d.pose==='sniffclose'){
+    const f=Math.floor(t*0.5)%2;                                                // alternating puffs
+    ctx.fillStyle='rgba(255,255,255,.5)';
+    ctx.beginPath(); ctx.ellipse(mx+4, my+6-f*2, 2, 1.4, 0, 0, Math.PI*2); ctx.fill();
+  }
+}
+
 function drawDog(d, t){
   ctx.save();
   scaleAbout(d.x, d.y, SC);
   if(d.dir<0){ ctx.translate(d.x,0); ctx.scale(-1,1); ctx.translate(-d.x,0); }  // face left
+  const pal = dogPalette(d.breed);
+  // sit/flop/rear/bow are structurally different silhouettes (not walking), so they get
+  // their own small generic-by-palette functions rather than shoehorning a crouch/sit
+  // into the walking per-breed geometry below.
+  if(d.pose==='sit'){ drawDogSit(d,t,pal); ctx.restore(); return; }
+  if(d.pose==='flop'){ drawDogFlop(d,t,pal); ctx.restore(); return; }
+  if(d.pose==='rear'){ drawDogRear(d,t,pal); ctx.restore(); return; }
+  if(d.pose==='bow'){ drawDogBow(d,t,pal); ctx.restore(); return; }
   // pet reactions: a hop, an extra-waggy tail, or a tongue-out lick
   const _now=performance.now();
   const react=(d.react && _now<d.react.until)?d.react:null;
@@ -5391,9 +5598,13 @@ function drawDog(d, t){
   const eatBob = d.eating ? Math.abs(Math.sin(t*0.8))*3 : 0;    // head dips toward the bowl while eating/drinking
   const wagAmp=(react&&react.type==='wag')?4:2, wagSpd=(react&&react.type==='wag')?1.4:0.55;
   const x=d.x, groundY=d.y, y=d.y+jump+eatBob;
-  const ph = (Math.floor(t*0.34)&1) ? 1 : -1;        // leg swing phase
-  const bob = Math.round(Math.sin(t*0.30))|0;        // head bob (0/1)
-  const wag = Math.round(Math.sin(t*wagSpd)*wagAmp); // tail wag (bigger/faster mid-pet)
+  // zoomies/sniff run the SAME leg/tail formulas at a different effective rate, so no
+  // change is needed inside the (already-tested) per-breed bodies below.
+  const tRate = d.behavior==='zoomies' ? 2.2 : d.behavior==='sniff' ? 0.45 : 1;
+  const tEff = t*tRate;
+  const ph = (Math.floor(tEff*0.34)&1) ? 1 : -1;        // leg swing phase
+  const bob = d.behavior==='sniff' ? 5 : (Math.round(Math.sin(tEff*0.30))|0);   // head bob (nose-down while sniffing)
+  const wag = Math.round(Math.sin(tEff*wagSpd)*wagAmp); // tail wag (bigger/faster mid-pet)
   // ground contact shadow (stays on the floor even during a hop)
   ctx.fillStyle='rgba(0,0,0,.18)'; ctx.beginPath(); ctx.ellipse(x, groundY+1, 22, 4, 0, 0, Math.PI*2); ctx.fill();
 
@@ -5463,8 +5674,83 @@ function drawDog(d, t){
   if(react){
     miniHeart(x-5, y-24-rp*8); miniHeart(x+5, y-20-rp*10);
     if(react.type==='lick'){ px(x+20, y-6, 4, 7, '#e79ab0'); px(x+20, y-1, 4, 2, '#d47a92'); px(x+21, y-6, 1, 3, '#f4c0d0'); } // tongue
+    if(react.type==='violence'){                                          // recoiling from a cat swat during an encounter
+      const sw=Math.sin(rp*Math.PI);
+      ctx.strokeStyle='rgba(255,255,255,'+(0.6*(1-Math.abs(rp-0.5)*2)).toFixed(2)+')'; ctx.lineWidth=1.4;
+      for(let i=0;i<3;i++){ ctx.beginPath(); ctx.moveTo(x+16-i*4-sw*3, y-24); ctx.lineTo(x+20-i*4-sw*3, y-8); ctx.stroke(); }
+    }
   }
+  drawDogOverlay(d, t, pal);
   ctx.restore();
+}
+
+// ---- generic (breed-coloured) poses: sitting, lying flat, rearing up, and the play bow --
+// All four use the SAME dogPalette(breed) as the walking body, so any breed reads
+// consistently across every pose without duplicating each breed's construction 4x more.
+function drawDogSit(d, t, pal){
+  const x=d.x, y=d.y;
+  ctx.fillStyle='rgba(0,0,0,.18)'; ctx.beginPath(); ctx.ellipse(x,y+2,16,4,0,0,Math.PI*2); ctx.fill();
+  const sweep = Math.round(Math.sin(t*0.8)*6);                            // tail sweeping an arc on the floor
+  px(x-pal.bw/2-2, y+3, 8, 3, pal.cd); px(x-pal.bw/2-4+sweep*0.3, y+2, 4, 2, pal.c);
+  _leg(x-10, y-6, 8, 4, pal.cd); _leg(x+4, y-6, 8, 4, pal.c);              // haunches sitting flat
+  ro(x-12, y-16, pal.bw*0.7, 14, pal.c); px(x-12,y-16,pal.bw*0.7,2,pal.ch); // upright torso
+  const hx=x+8, hy=y-30;
+  ro(hx-6, hy, 15, 13, pal.c); px(hx-6,hy,15,2,pal.ch);
+  px(hx+8, hy+4, 6, 5, pal.c); px(hx+13, hy+5, 2, 3, pal.nose);            // muzzle + nose
+  px(hx-4, hy-5, 4, 6, pal.ear); px(hx+4, hy-5, 4, 6, pal.ear);            // ears perked forward (begging)
+  px(hx+7, hy+2, 2, 2, pal.nose);                                          // eye
+  if((Math.floor(t*0.4)%3)===0) px(hx+13, hy+9, 1, 3, '#cfe6f5');         // an occasional drool pixel
+  drawDogOverlay(d, t, pal);
+}
+
+function drawDogFlop(d, t, pal){
+  const x=d.x, y=d.y;
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x,y+3,24,5,0,0,Math.PI*2); ctx.fill();
+  const breathe = Math.sin(t*0.5)*1;                                       // slow chest rise
+  ro(x-22, y-9-breathe, 44, 11, pal.c); px(x-22,y-9-breathe,44,2,pal.ch);   // wide low slab, lying on its side
+  px(x-24, y-2, 8, 4, pal.cd); px(x+18, y-2, 8, 4, pal.cd);                // legs extended flat forward/back
+  const hx=x+20, hy=y-13;
+  ro(hx, hy, 13, 10, pal.c); px(hx,hy,13,2,pal.ch);
+  px(hx+11, hy+3, 5, 4, pal.c); px(hx+15,hy+4,2,2,pal.nose);
+  px(hx-2, hy-1, 4, 5, pal.ear);
+  px(hx+2, hy+2, 1, 1, pal.nose);                                          // closed/sleepy eye
+  const f=t*0.6;
+  ctx.fillStyle=PAL.ink; ctx.font='6px "Press Start 2P", monospace';
+  ctx.fillText('z', x+2-((f)%10), y-20-((f)%10));
+  ctx.font='5px "Press Start 2P", monospace'; ctx.fillText('z', x+7-((f+5)%12), y-16-((f+5)%12));
+}
+
+function drawDogRear(d, t, pal){
+  const x=d.x, y=d.y;
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x,y+2,12,4,0,0,Math.PI*2); ctx.fill();
+  _leg(x-6, y-8, 8, 4, pal.cd); _leg(x+2, y-8, 8, 4, pal.c);               // standing on hind legs
+  ro(x-9, y-26, pal.bw*0.55, 20, pal.c); px(x-9,y-26,pal.bw*0.55,2,pal.ch); // upright body
+  const wag=Math.round(Math.sin(t*1.4)*3);
+  px(x-11, y-8, 3, 8, pal.cd); px(x-12, y-14+wag, 3, 5, pal.cd);           // tail down, alert wag
+  const bark = (Math.floor(t*1.5)%2)===0;
+  const hx=x+2, hy=y-34;
+  ro(hx-4, hy, 14, 12, pal.c); px(hx-4,hy,14,2,pal.ch);
+  px(hx+8, hy+3+(bark?2:0), 6, bark?6:4, pal.c);                          // open/closed muzzle
+  px(hx+13, hy+4, 2, 3, pal.nose);
+  px(hx-4, hy-5, 4, 6, pal.ear); px(hx+4, hy-5, 4, 6, pal.ear);
+  px(hx+6, hy+2, 1, 1, pal.nose);
+  px(x-8, y-4, 3, 4, pal.c); px(x+4, y-4, 3, 4, pal.c);                    // front paws raised, off the ground
+  if(bark){ ctx.fillStyle=PAL.ink; ctx.font='5px "Press Start 2P", monospace'; ctx.fillText('WOOF!', x+8, y-38); }
+}
+
+function drawDogBow(d, t, pal){
+  const x=d.x, y=d.y;
+  ctx.fillStyle='rgba(0,0,0,.17)'; ctx.beginPath(); ctx.ellipse(x,y+2,20,4,0,0,Math.PI*2); ctx.fill();
+  px(x-6, y-3, 5, 5, pal.cd); px(x+2, y-3, 5, 5, pal.c);                   // front legs collapsed flat
+  _leg(x-14, y-14, 9, 4, pal.cd); _leg(x-7, y-14, 9, 4, pal.c);            // rear legs still standing -> rear end up
+  ro(x-16, y-6, pal.bw*0.7, 6, pal.c);                                     // chest low to the floor
+  ro(x-6, y-18, pal.bw*0.55, 13, pal.c); px(x-6,y-18,pal.bw*0.55,2,pal.ch); // raised rear/back
+  const wag=Math.round(Math.sin(t*2.2)*5);
+  px(x-17, y-20+wag, 4, 9, pal.c); px(x-19, y-25+wag, 4, 5, pal.cd);       // tail high, whipping fast
+  const hx=x+10, hy=y-9;
+  ro(hx, hy, 13, 9, pal.c); px(hx+10,hy+3,5,4,pal.c); px(hx+14,hy+4,2,3,pal.nose);
+  px(hx-2, hy-4, 4, 5, pal.ear);
+  drawDogOverlay(d, t, pal);
 }
 
 // CAT: rounded curled body when sleeping (tail wrapped, Zzz rising), or a small
@@ -5635,7 +5921,7 @@ function petDog(){ const d=amb.dog; if(!d) return;
   const type=['wag','lick','jump'][(Math.random()*3)|0];
   const now=performance.now(); d.react={type, start:now, until:now+950};
 }
-function petCat(){ const c=amb.cat; if(!c) return; initAudio();
+function petCat(){ const c=amb.cat; if(!c || c.encounter) return; initAudio();   // don't interrupt a dog encounter
   const type=['purr','reposition','violence'][(Math.random()*3)|0];
   const now=performance.now();
   if(type==='reposition'){
