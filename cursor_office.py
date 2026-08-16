@@ -5263,7 +5263,15 @@ function updateCatBehavior(c, now, sec){
     if(d<=c.spd*sec+1 && c.behavior!=='roam' && c.behavior!=='chase'){
       c.x=c.tx; c.y=c.ty; c.walking=false;    // arrived -> hold the stationary pose for the rest of the duration
     } else if(d>0.5){
-      c.x+=dx/d*c.spd*sec; c.y+=dy/d*c.spd*sec; c.dir=dx>=0?1:-1;
+      // Clamp the step to the remaining distance. roam/chase deliberately skip the
+      // arrival branch above (they keep re-targeting), so an unclamped full step
+      // OVERSHOOTS the target, dx flips sign next frame, and c.dir mirrors the sprite --
+      // every frame. That read as the cat spinning wildly on the spot.
+      const step = Math.min(d, c.spd*sec);
+      c.x += dx/d*step; c.y += dy/d*step;
+      // Only re-face on meaningful horizontal movement: without this dead zone, sub-pixel
+      // jitter around a reached target flips the sprite back and forth at frame rate.
+      if(Math.abs(dx) > 2) c.dir = dx>=0 ? 1 : -1;
     }
   }
   if(now>=c.bUntil){
