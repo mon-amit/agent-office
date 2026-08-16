@@ -2868,17 +2868,157 @@ function lerpCol(a,b,t){ const pa=parseInt(a.slice(1),16),pb=parseInt(b.slice(1)
 function cloud(cx,cy){ cx|=0; cy|=0; px(cx,cy,15,4,PAL.cloud); px(cx+3,cy-3,9,4,PAL.cloud); px(cx+1,cy+3,17,2,'rgba(255,255,255,.75)'); }
 // a row of city buildings sitting on the window sill (clipped to x..x+w).
 // `lit` => night mode: warm yellow lit windows speckled across dark silhouettes.
-function drawSkyline(x,y,w,h,col,hf,step,lit){
+function drawSkyline(x,y,w,h,col,hf,step,lit,snowCap){
   const hs=[16,26,12,32,20,28,15,24,18,30,22,14]; let bx=x+1,i=0; const baseY=y+h;
   while(bx<x+w-1){ const bw=Math.min(10+(i%4)*5, x+w-1-bx);
     const bh=Math.round(h*hf*(0.45+0.55*(hs[(i*step)%hs.length]/32)));
     px(bx,baseY-bh,bw,bh,col);
+    // winter roof snow: translucent on LIT (night) silhouettes so it reads as a dim cap
+    // instead of a hard near-white line glowing off a near-black building.
+    if(snowCap) px(bx,baseY-bh,bw,1, lit?'rgba(255,255,255,.55)':'#f2f6ff');
     for(let wy=baseY-bh+3;wy<baseY-2;wy+=5) for(let wx=bx+2;wx<bx+bw-2;wx+=4){
       if(lit){ const on=((wx*31+wy*17+i*13)%5===0); px(wx,wy,1,2, on?PAL.litWin:'rgba(255,255,255,.05)'); }
       else px(wx,wy,1,2,PAL.bldgWin);
     }
     bx+=bw+3; i++;
   }
+}
+
+// ==========================================================================================
+// SEASONS + WEATHER. Three orthogonal axes, composed rather than substituted:
+//   MODE   (existing, untouched)  skyMode() still decides day/dusk/night from the real sun.
+//   SEASON (new)                  selects WHICH palette that mode renders + a season extra.
+//   WEATHER(new)                  a continuous 0..5 storm level that ADDS overlays on top.
+// ==========================================================================================
+const SEASON_MONTH = ['winter','winter','spring','spring','spring','summer','summer','summer','fall','fall','fall','winter'];
+function currentSeason(){
+  if(window.__forceSeason) return window.__forceSeason;
+  const north = localCoords()[0] >= 0;
+  let s = SEASON_MONTH[new Date().getMonth()];
+  if(!north){ const flip={winter:'summer',summer:'winter',spring:'fall',fall:'spring'}; s=flip[s]; }
+  return s;
+}
+// per-season sky gradients for day/dusk, and a distinctly-tinted night, plus a skyline tint.
+// Hex literals throughout -- lerpCol only parses '#hex' (see the shade(shade()) gotcha noted
+// at the original day/dusk branch below).
+const SEASON_SKY = {
+  summer: { day:['#8fd4f2','#d3f1fa'], dusk:['#8fb8d8','#ffab5a'], night:['#171436','#46315f'], bldgDay:'#7c87b0', bldgNight:'#211c40' },
+  fall:   { day:['#8ec6e6','#ecdcb0'], dusk:['#a2aac2','#f09a52'], night:['#1a1830','#3d3050'], bldgDay:'#9b9cb8', bldgNight:'#2b2440' },
+  winter: { day:['#adc9dd','#e6eff5'], dusk:['#b7bfd4','#f4c6c0'], night:['#0f1330','#2f3a63'], bldgDay:'#8d9bb2', bldgNight:'#232043' },
+  spring: { day:['#93d6ef','#dbf2e6'], dusk:['#a0bcd8','#f7cf86'], night:['#161a38','#33395c'], bldgDay:'#84a0b6', bldgNight:'#221f42' },
+};
+
+// ---- storm ladder: a single continuously-eased level, no lookup tables (that path is what
+// produced a NaN at a peak exactly on an array boundary in an earlier draft -- a plain
+// eased float sidesteps the whole class of bug and still "walks through every level below
+// the peak" for free, since easing from 0 to 5 passes through 1/2/3/4 as real values). ----
+let stormLvlF = 0, stormPeak = 0, stormPhase = 'up', stormHoldUntil = 0, nextStormAt = 0;
+const STORM_RATE = 0.55;                              // levels/sec
+function scheduleNextStorm(now){
+  let mn=210000, mx=600000;                           // 3.5-10 min, real quiet stretches between events
+  if(window.__stormInterval){ mn=window.__stormInterval[0]; mx=window.__stormInterval[1]; }
+  nextStormAt = now + mn + Math.random()*(mx-mn);
+}
+function startStorm(now){
+  const weights={1:0.44,2:0.28,3:0.16,4:0.08,5:0.04};
+  stormPeak = parseInt(weightedPick(weights), 10); stormPhase='up';
+}
+function updateWeatherLevel(now, sec){
+  if(!nextStormAt) scheduleNextStorm(now);
+  if(stormPeak===0 && now>=nextStormAt){ startStorm(now); scheduleNextStorm(now); }
+  const target = (stormPeak>0 && stormPhase!=='down') ? stormPeak : 0;
+  const diff = target - stormLvlF;
+  stormLvlF += Math.sign(diff) * Math.min(Math.abs(diff), STORM_RATE*sec);
+  if(stormPeak>0){
+    if(stormPhase==='up' && Math.abs(stormLvlF-stormPeak)<0.05){ stormPhase='hold'; stormHoldUntil=now+(14000+stormPeak*6000); }
+    else if(stormPhase==='hold' && now>=stormHoldUntil){ stormPhase='down'; }
+    else if(stormPhase==='down' && stormLvlF<=0.03){ stormLvlF=0; stormPeak=0; stormPhase='up'; }
+  }
+}
+
+// ---- precipitation / season trickle: one shared array, counted PER KIND so a season whose
+// ambient trickle differs from the storm's own precipitation (fall leaves vs. rain) can never
+// starve one another -- that cross-kind collision was a real bug in an earlier draft. ----
+let weatherParticles = [];
+const WEATHER_CAP = 90;
+function spawnWeatherMark(kind){
+  const vy = kind==='flake' ? 16+Math.random()*16 : kind==='leaf' ? 20+Math.random()*20 :
+             kind==='blossom' ? 12+Math.random()*10 : 190+Math.random()*90;
+  const vx = (Math.random()*2-1) * (kind==='drop' ? 24+stormLvlF*14 : 14);
+  // life derived from fall speed so it ALWAYS comfortably reaches the bottom before expiring
+  // (a flat random life range let slow petals pop out of existence mid-pane in an earlier draft).
+  const life = (WIN.h+16)/vy*1.35;
+  weatherParticles.push({kind, x:WIN.x+Math.random()*WIN.w, y:WIN.y-4, vx, vy, life, age:0, sway:Math.random()*6.28});
+}
+function updateWeatherParticles(sec){
+  for(let i=weatherParticles.length-1;i>=0;i--){
+    const p=weatherParticles[i]; p.age+=sec;
+    if(p.age>=p.life || p.y>WIN.y+WIN.h+6){ weatherParticles.splice(i,1); continue; }
+    p.sway += sec*2;
+    const swayAmt = p.kind==='drop' ? 0 : Math.sin(p.sway)*(p.kind==='blossom'?9:13)*sec;
+    p.x += p.vx*sec + swayAmt; p.y += p.vy*sec;
+    if(p.x<WIN.x-12 || p.x>WIN.x+WIN.w+12){ weatherParticles.splice(i,1); continue; }
+  }
+  if(weatherParticles.length>WEATHER_CAP) weatherParticles.splice(0, weatherParticles.length-WEATHER_CAP);
+}
+function updateWeatherPopulation(season, sec){
+  const stormKind = season==='winter' ? 'flake' : 'drop';
+  const trickleKind = season==='fall' ? 'leaf' : season==='spring' ? 'blossom' : null;   // winter's trickle IS its stormKind
+  const stormWantRaw = Math.round(Math.min(85, stormLvlF*19));
+  const stormWant = stormKind==='flake' ? Math.max(stormWantRaw, 3) : stormWantRaw;      // winter: always a light flurry
+  const haveStorm = weatherParticles.reduce((n,p)=>n+(p.kind===stormKind?1:0),0);
+  if(haveStorm<stormWant && Math.random()<sec*8) spawnWeatherMark(stormKind);
+  if(trickleKind){
+    const haveTrickle = weatherParticles.reduce((n,p)=>n+(p.kind===trickleKind?1:0),0);
+    const trickleWant = 3 + Math.round(stormLvlF*3);                                     // a real gale multiplies the trickle
+    if(haveTrickle<trickleWant && Math.random()<sec*0.9) spawnWeatherMark(trickleKind);
+  }
+}
+function drawWeatherParticle(p){
+  if(p.kind==='drop'){ px(Math.round(p.x), Math.round(p.y), 1, 5+Math.round(stormLvlF), 'rgba(150,190,230,.6)'); return; }
+  const col = p.kind==='flake' ? 'rgba(255,255,255,.9)' : p.kind==='leaf' ? '#c9822f' : '#f3c6d8';
+  px(Math.round(p.x), Math.round(p.y), p.kind==='flake'?1:2, p.kind==='flake'?1:2, col);
+}
+
+// ---- shooting stars: night only, and only when the sky is actually clear enough to see one ----
+let shootingStar = null, nextShootingStarAt = 0;
+function scheduleNextShootingStar(now){
+  let mn=25000, mx=70000; if(window.__starInterval){ mn=window.__starInterval[0]; mx=window.__starInterval[1]; }
+  nextShootingStarAt = now + mn + Math.random()*(mx-mn);
+}
+function updateShootingStar(now, sec, night){
+  if(!nextShootingStarAt) scheduleNextShootingStar(now);
+  if(!shootingStar && night && stormLvlF<1 && now>=nextShootingStarAt){
+    shootingStar = { x:WIN.x+Math.random()*WIN.w*0.5, y:WIN.y+2, vx:70+Math.random()*30, vy:26+Math.random()*10, age:0 };
+    scheduleNextShootingStar(now);
+  }
+  if(shootingStar){
+    shootingStar.age += sec; shootingStar.x += shootingStar.vx*sec; shootingStar.y += shootingStar.vy*sec;
+    if(shootingStar.age>0.9 || shootingStar.x>WIN.x+WIN.w || shootingStar.y>WIN.y+WIN.h) shootingStar=null;
+  }
+}
+function drawShootingStar(){
+  if(!shootingStar) return;
+  const s=shootingStar;
+  for(let i=0;i<7;i++){ const a=Math.max(0,(1-i/7)); px(Math.round(s.x-i*3), Math.round(s.y-i*1.1), 1, 1, 'rgba(255,255,255,'+(a*0.9).toFixed(2)+')'); }
+}
+
+// ---- lightning: edge-scheduled bolt strikes, level 4+ only ----
+let lightningAt = 0, lightningFlashUntil = 0;
+function updateLightning(now){
+  if(stormLvlF<3.5){ lightningAt=0; return; }
+  if(!lightningAt) lightningAt = now + 2600 + Math.random()*(stormLvlF>=5 ? 2600 : 5200);
+  if(now>=lightningAt){
+    lightningFlashUntil = now+130;
+    lightningAt = now + 1200 + Math.random()*(stormLvlF>=5 ? 2600 : 5200);
+  }
+}
+function drawLightningBolt(x,y,w,h){
+  let bx=x+w*0.3+Math.random()*w*0.4, by=y+2;
+  ctx.strokeStyle='rgba(255,255,255,.9)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(bx,by);
+  for(let i=0;i<5;i++){ bx += (Math.random()*14-7); by += (h-4)/5; ctx.lineTo(bx,by); }
+  ctx.stroke();
 }
 // ---- day / dusk / night in the window, from the REAL sun position -- season- AND place-aware,
 // with NO location permission. The browser hands us the IANA time-zone name for free via Intl;
@@ -2961,33 +3101,96 @@ function drawWindow(x,y,w,h){
   // chunky frame
   px(x-5,y-5,w+10,h+10,PAL.woodDk); px(x-3,y-3,w+6,h+6,PAL.wood); px(x-3,y-3,w+6,2,PAL.woodHi);
   const mode=skyMode(), night=(mode==='night'), bands=10, bh=Math.ceil(h/bands);
+  const season = currentSeason(), ssky = SEASON_SKY[season];
+  const storm = Math.max(0, Math.min(1, (stormLvlF-1)/4));   // 0..1, used for ocean/tree/lean effects
+  const winter = season==='winter';
   if(night){
-    for(let i=0;i<bands;i++) px(x, y+Math.round(i*h/bands), w, bh, lerpCol(PAL.nightTop, PAL.nightBot, i/(bands-1)));
-    // scattered stars (deterministic) in the upper sky
-    for(let s=0;s<48;s++){ const sx=x+((s*73)%(w-4))+2, sy=y+((s*37)%Math.max(1,Math.round(h*0.5)))+2;
-      px(sx,sy,1,1, s%6? 'rgba(255,255,255,.85)':'rgba(255,255,255,.45)'); }
-    // crescent moon (top-right)
-    const mnx=x+w-Math.round(w*0.20), mny=y+Math.round(h*0.16);
-    px(mnx,mny,8,8,PAL.moon); px(mnx+4,mny-1,6,8, lerpCol(PAL.moon,PAL.nightTop,.4));
-    cloud(x+w*0.30, y+h*0.16);
-    drawSkyline(x,y,w,h, PAL.bldgN2, 0.42, 7, true);
-    drawSkyline(x,y,w,h, PAL.bldgN1, 0.64, 11, true);
+    const [nTop,nBot] = ssky.night;
+    for(let i=0;i<bands;i++) px(x, y+Math.round(i*h/bands), w, bh, lerpCol(nTop, nBot, i/(bands-1)));
+    // scattered stars (deterministic) in the upper sky -- dimmed by cloud cover
+    const starA = Math.max(0, 1-stormLvlF/2.5);
+    if(starA>0.05) for(let s=0;s<48;s++){ const sx=x+((s*73)%(w-4))+2, sy=y+((s*37)%Math.max(1,Math.round(h*0.5)))+2;
+      px(sx,sy,1,1, 'rgba(255,255,255,'+((s%6?0.85:0.45)*starA).toFixed(2)+')'); }
+    // crescent moon (top-right), fading behind heavier cloud
+    const moonA = Math.max(0, 1-stormLvlF/2);
+    if(moonA>0.05){
+      const mnx=x+w-Math.round(w*0.20), mny=y+Math.round(h*0.16);
+      ctx.save(); ctx.globalAlpha=moonA;
+      px(mnx,mny,8,8,PAL.moon); px(mnx+4,mny-1,6,8, lerpCol(PAL.moon,nTop,.4));
+      ctx.restore();
+    }
+    ctx.save(); ctx.globalAlpha=Math.max(0.4, 1-stormLvlF*0.15); cloud(x+w*0.30, y+h*0.16); ctx.restore();
+    drawSkyline(x,y,w,h, shade(ssky.bldgNight,.06), 0.42, 7, true, winter);
+    drawSkyline(x,y,w,h, ssky.bldgNight, 0.64, 11, true, winter);
   } else {
-    let top=PAL.skyTop, bot=PAL.sky;
-    // golden hour: dusty-blue upper sky warming to a bright gold horizon. HEX literals on
-    // purpose -- the gradient loop below feeds top/bot back into lerpCol(), and lerpCol only
-    // parses '#hex' (rgb() results from a nested lerpCol/shade come out NaN -> black). See the
-    // shade(shade()) gotcha in CLAUDE.md.
-    if(mode==='dusk'){ top='#9fb8d4'; bot='#f4c07a'; }
+    const [top,bot] = ssky[mode];   // mode is 'day' or 'dusk' here (never 'night')
     for(let i=0;i<bands;i++) px(x, y+Math.round(i*h/bands), w, bh, lerpCol(top, bot, i/(bands-1)));
-    drawSkyline(x,y,w,h, PAL.bldg2, 0.40, 7, false);
-    cloud(x+w*0.16, y+h*0.20); cloud(x+w*0.44, y+h*0.12); cloud(x+w*0.70, y+h*0.26);
-    drawSkyline(x,y,w,h, PAL.bldg1, 0.62, 11, false);
+    // SUNSET: whenever the real sun is actually near the horizon, the "dusk" mode itself IS
+    // the sunset window (skyMode() already only returns 'dusk' for the real +-6 degree band
+    // around sunrise/sunset) -- add a real sun disc + horizon glow, occluded by the near
+    // skyline as it "sets", suppressed once clouds/storm would hide it anyway.
+    if(mode==='dusk' && stormLvlF<2){
+      const sx=x+Math.round(w*0.72), sy=y+Math.round(h*0.62);
+      ctx.save(); ctx.globalAlpha=Math.max(0,1-stormLvlF/2);
+      for(let g=3;g>=1;g--) px(x, y+h-g*6, w, 5, 'rgba(255,170,90,'+(0.10/g).toFixed(2)+')');   // horizon glow bands
+      ctx.fillStyle='#ff9a52'; ctx.beginPath(); ctx.ellipse(sx,sy,5,5,0,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+    drawSkyline(x,y,w,h, shade(ssky.bldgDay,.10), 0.40, 7, false, winter);
+    // cloud count scales with storm level; extras DRIFT (clipped, or they'd bleed onto the
+    // frame -- an earlier draft left them unclipped and painted the wall beside the window).
+    const baseClouds=[[0.16,0.20],[0.44,0.12],[0.70,0.26]];
+    for(const [fx,fy] of baseClouds) cloud(x+w*fx, y+h*fy);
+    const extra = Math.round(Math.min(3, stormLvlF));
+    if(extra>0){
+      ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip();
+      for(let i=0;i<extra;i++){
+        const sp=14+i*5, span=w+40;
+        const cx = x-20 + (((tCount*sp + i*97)%span)+span)%span;   // positive-modulo wrap, never negative
+        cloud(cx, y+h*(0.15+i*0.12));
+      }
+      ctx.restore();
+    }
+    drawSkyline(x,y,w,h, shade(ssky.bldgDay,-.08), 0.62, 11, false, winter);
   }
+  // ---- STORM DIM: painted BEFORE the plane/Godzilla clip so both stay readable in front of
+  // the murk, hard-capped in night mode and cut further while Godzilla's own back-lit rim is
+  // the only thing separating him from a dark sky. ----
+  const dimBase = Math.min(0.32, stormLvlF*0.07);
+  const dim = night ? Math.min(dimBase,0.16) : dimBase;
+  const dimFinal = godzilla.active ? dim*0.35 : dim;
+  if(dimFinal>0.005) px(x,y,w,h,'rgba(60,66,80,'+dimFinal.toFixed(2)+')');
   // occasional airliner drifting across the sky (clipped to the glass, behind the mullions)
   if(amb.plane){ ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip(); drawPlane(amb.plane); ctx.restore(); }
   // Godzilla stomping past the skyline (clipped to the glass, behind the mullions)
   if(godzilla.active){ ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip(); drawGodzilla(x,y,w,h,night); ctx.restore(); }
+  // shooting stars (night only, clear sky only) + lightning bolt, both clipped to the glass
+  if(night || stormLvlF>=3.5){
+    ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip();
+    if(night) drawShootingStar();
+    if(stormLvlF>=3.5 && performance.now()<lightningFlashUntil) drawLightningBolt(x,y,w,h);
+    ctx.restore();
+  }
+  // precipitation (rain/snow/leaves/blossom), clipped to the glass
+  if(weatherParticles.length){
+    ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip();
+    for(const p of weatherParticles) drawWeatherParticle(p);
+    ctx.restore();
+  }
+  // whole-room lightning flash: a bright, brief, low-alpha wash so a thunderstorm strike
+  // reads indoors too, not just as a bolt behind the glass.
+  if(stormLvlF>=3.5 && performance.now()<lightningFlashUntil) px(0,0,W,H,'rgba(255,255,255,.10)');
+  // summer heat haze: two shimmering translucent bands low over the skyline, clipped
+  if(season==='summer' && !night){
+    ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip();
+    for(let k=0;k<2;k++){ const hx=x+Math.round(Math.sin(tCount/58+k*2.1)*4);
+      px(hx, y+h-10-k*5, w, 1, 'rgba(255,255,255,.18)'); }
+    ctx.restore();
+  }
+  // winter snow ledge along the inside bottom of the glass, scalloped
+  if(winter){
+    for(let sx=x; sx<x+w; sx+=6){ const sh=2+((hash('sl'+sx)%2)); px(sx, y+h-sh, 5, sh, '#f2f6ff'); }
+  }
   // chunky mullions: vertical panes + one horizontal transom (dark core + light edge)
   const panes=4, pw=w/panes;
   for(let i=1;i<panes;i++){ px(x+Math.round(i*pw)-1,y,3,h,PAL.woodDk); px(x+Math.round(i*pw)-1,y,1,h,PAL.wood); }
@@ -2995,7 +3198,23 @@ function drawWindow(x,y,w,h){
   px(x,y,w,1,'rgba(0,0,0,.22)'); px(x,y+h-1,w,1,'rgba(0,0,0,.22)');
   // glass sheen on the top-left pane
   px(x+2,y+2,Math.round(pw)-5,2, night?'rgba(255,255,255,.07)':'rgba(255,255,255,.20)');
+  // rain beads on the INSIDE face of the glass -- drawn last (interior face), fade in as the
+  // storm crosses level 2 and linger briefly after it passes. Skipped in winter (frost, not
+  // liquid beads, would form instead; keeping it simple and just omitting beads there).
+  if(!winter){
+    const wetTarget = stormLvlF>=2 ? 1 : 0;
+    _glassWet += (wetTarget-_glassWet) * Math.min(1, 0.15);
+    if(_glassWet>0.02){
+      ctx.save(); ctx.globalAlpha=Math.min(1,_glassWet); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip();
+      for(let b=0;b<14;b++){ const bx=x+((b*37+11)%w), by=y+((b*53+7)%h);
+        px(bx,by,1,1,'rgba(200,225,245,.5)'); }
+      for(let r=0;r<3;r++){ const rx=x+((r*83+((tCount*0.4)|0))%w);
+        px(rx, y+((r*19)%(h-6)), 1, 6, 'rgba(200,225,245,.35)'); }
+      ctx.restore();
+    }
+  }
 }
+let _glassWet = 0;   // 0..1, eased -- how wet the inside of the glass currently looks
 
 // a hunched Godzilla silhouette lumbering across the window (drawn clipped to the glass).
 // godzilla.t (0..1) drives it from off the left edge to off the right edge.
@@ -3687,12 +3906,17 @@ function drawBeachFloor(){
   // shared rAF clock `tCount` (advanced in tick() as `tCount += dt*0.06`, ~60 units/s)
   // so it can never drift or fight the sand-grain cache -- no setInterval, no re-hashing.
   const tide  = Math.sin(tCount/74);                    // ~7.7s period, [-1,1] breath
-  const surge = Math.round(tide*2);                     // waterline advances/recedes +-2px
+  // storm surge: amplifies the SAME tide breath, deliberately kept modest (max +8px on top
+  // of the existing +-2px) so even a hurricane never pushes the waterline near a beach
+  // sitter's seat -- BSPOTS/SHORE_X themselves are untouched.
+  const stormT = Math.max(0, Math.min(1, (stormLvlF-1)/4));
+  const surge = Math.round(tide*(2 + 8*stormT));
   const wtrX  = shoreX + surge, wtrW = W - wtrX;         // dynamic sea edge
   // depth: darker deep water out to sea, lighter shallows near the shore
   px(wtrX, y0, wtrW, hgt, '#2f9fbf');                                     // mid water
   px(W-Math.round(wtrW*0.42), y0, Math.round(wtrW*0.42), hgt, '#1f82a6'); // deep far edge
   px(wtrX, y0, Math.max(8,Math.round(wtrW*0.36)), hgt, '#5cc4da');        // shallows near shore
+  if(stormT>0.02) px(wtrX, y0, wtrW, hgt, 'rgba(40,60,70,'+(stormT*0.22).toFixed(2)+')');  // choppy murk tint
   // slow shimmer: a soft light band drifting seaward-and-back across the water (~10s)
   const sweep = wtrX + 2 + Math.round(((Math.sin(tCount/96)+1)/2)*(wtrW-6));
   px(sweep, y0, 2, hgt, 'rgba(255,255,255,.15)'); px(sweep+2, y0, 1, hgt, 'rgba(255,255,255,.07)');
@@ -4703,6 +4927,13 @@ function tick(now){
   }
   updateAmbient(now, dt);
   updateDelivery(now);
+  { const sec=dt/1000, season=currentSeason();
+    updateWeatherLevel(now, sec);
+    updateWeatherPopulation(season, sec);
+    updateWeatherParticles(sec);
+    updateShootingStar(now, sec, skyMode()==='night');
+    updateLightning(now);
+  }
   render(tCount);
   requestAnimationFrame(tick);
 }
@@ -5530,7 +5761,13 @@ function updateAmbient(now, dt){
   }
   // occasional airliner across the window sky (independent long-gap scheduler)
   if(!nextPlaneAt) schedulePlane(now);
-  else if(now>=nextPlaneAt){ if(!amb.plane) startPlane(now); schedulePlane(now); }
+  else if(now>=nextPlaneAt){
+    // no new take-off in a heavy storm; the scheduler still reschedules, so it just tries
+    // again after the storm. A plane ALREADY airborne is left to finish its crossing rather
+    // than being nulled mid-flight, which would read as a bug, not weather.
+    if(!amb.plane && stormLvlF<3.5) startPlane(now);
+    schedulePlane(now);
+  }
   if(amb.plane){ const pl=amb.plane; pl.x += pl.dir*pl.spd*sec;
     if((pl.dir>0 && pl.x>WIN.x+WIN.w+24) || (pl.dir<0 && pl.x<WIN.x-24)) amb.plane=null; }
 }
