@@ -76,6 +76,11 @@ CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 # transcripts here so non-Cursor/non-Claude agent activity can show up in the same
 # office, tagged with its own `source` ("notion") rather than masquerading as Claude.
 NOTION_PROJECTS_DIR = os.path.expanduser("~/.notion-office/projects")
+# Bookshelf/Library cover art: small thumbnail images + factual bibliographic metadata
+# (publisher/date/page-count/categories/rating -- NOT jacket-copy prose) fetched ONCE,
+# offline, by scripts/fetch_covers.py, and served locally from here -- so the running app
+# needs no internet access at all. See scripts/fetch_covers.py to (re)run the fetch.
+COVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "covers")
 
 # Office (working/desk) vs kitchen (waiting) is decided by TURN STATE, not raw
 # write-recency: a session is "working" while its latest turn is still IN PROGRESS
@@ -2047,7 +2052,11 @@ PAGE = r"""<!DOCTYPE html>
   #screen .zonebtn[data-tip]:hover::after{opacity:1;transform:translateY(0);}
   #screen #sweep-kitchen[data-tip]::after{left:0;}                          /* extend right from the left corner */
   #screen #drown-beach[data-tip]::after{right:0;font-size:16px;padding:2px 8px;}  /* extend left; big devil */
+  #screen #call-cat[data-tip]::after{left:0;}
+  #screen #call-dog[data-tip]::after{left:0;}
   #screen #sweep-kitchen{left:7px;}
+  #screen #call-cat{left:37px;}
+  #screen #call-dog{left:67px;}
   #screen #drown-beach{right:22px;}   /* floats on the ocean band in the beach's bottom-right corner */
   #brand #sound.off,#brand #filter.off{color:#8a8a90;}
   #brand #filter.on{background:#2f5fb0;border-color:#3f6fc0;color:#fff;}
@@ -2093,6 +2102,17 @@ PAGE = r"""<!DOCTYPE html>
   #nametag .wf-phase.active{background:#b7791f;color:#fff4dd;}
   #nametag .wf-phase.pending{background:#33363f;color:#9aa0ab;}
   #nametag .wf-sep{color:var(--ink-lo);margin:0 3px;}
+  #nametag .nt-books{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;}
+  #nametag .nt-book{position:relative;width:44px;height:60px;border-radius:2px;padding:4px 3px;box-sizing:border-box;
+    display:flex;flex-direction:column;justify-content:flex-end;overflow:hidden;
+    border:1px solid rgba(255,255,255,.14);
+    font-size:6.5px;line-height:1.25;color:#fff;text-shadow:0 1px 1px rgba(0,0,0,.5);}
+  #nametag .nt-book .bt{font-weight:bold;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
+  #nametag .nt-book .ba{opacity:.8;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  #nametag .nt-book .bg{position:relative;top:-2px;font-size:6px;letter-spacing:.5px;opacity:.75;text-transform:uppercase;}
+  #nametag .nt-book img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none;}
+  #nametag .nt-book.has-real img{display:block;}
+  #nametag .nt-book.has-real .bg,#nametag .nt-book.has-real .bt,#nametag .nt-book.has-real .ba{display:none;}
   #legend{display:flex;gap:14px;justify-content:center;margin-top:12px;font-size:8px;color:#5a564d;}
   #legend span{display:inline-flex;align-items:center;gap:6px;}
   #legend i{width:10px;height:10px;border-radius:2px;display:inline-block;}
@@ -2126,6 +2146,68 @@ PAGE = r"""<!DOCTYPE html>
   #dfoot button{flex:1 1 auto;font-family:inherit;font-size:8px;padding:9px 8px;cursor:pointer;
     border:1px solid var(--panel);border-radius:5px;background:var(--panel);color:var(--ink-hi);}
   #dfoot button.ghost{background:#fff;color:var(--card-ink);border-color:var(--card-line);}
+
+  /* the Library: click the bookshelf -> a browsable grid of every book cover, with an
+     author-bio / glossary detail view. Mirrors #overlay/#dialog's look & feel. */
+  #liboverlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    background:rgba(15,24,8,.55);padding:14px;z-index:22;}
+  #libdialog{width:100%;max-width:760px;max-height:100%;background:var(--card);
+    border:3px solid var(--panel);border-radius:8px;display:flex;flex-direction:column;
+    box-shadow:0 0 0 3px var(--panel-line), 0 18px 40px rgba(0,0,0,.5);overflow:hidden;}
+  #libhead{background:var(--panel);color:var(--ink-hi);padding:12px 14px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px;}
+  #libhead .who{font-size:13px;color:var(--ink-hi);}
+  #libhead .sub{font-size:9px;color:var(--ink-mid);margin-top:6px;}
+  #libhead button{font-family:inherit;background:var(--panel2);color:var(--ink-hi);
+    border:1px solid var(--panel-line);border-radius:4px;font-size:9px;padding:5px 8px;cursor:pointer;}
+  #libtabs{display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px;background:#e7e7ea;
+    border-bottom:1px solid var(--card-line);}
+  #libtabs .libtab{font-family:inherit;font-size:9px;padding:6px 10px;border-radius:5px;
+    border:1px solid var(--card-line);background:#fff;color:var(--card-ink);cursor:pointer;}
+  #libtabs .libtab.active{background:var(--panel);color:var(--ink-hi);border-color:var(--panel);}
+  #libgrid{padding:14px;overflow-y:auto;overflow-x:hidden;display:grid;
+    grid-template-columns:repeat(4,minmax(0,1fr));
+    align-content:start;gap:12px;flex:1;min-width:0;}
+  #libgrid .libcard{min-width:0;cursor:pointer;border-radius:5px;background:none;border:0;padding:0;
+    display:flex;flex-direction:column;font-family:inherit;text-align:left;}
+  #libgrid .libcover{min-width:0;position:relative;aspect-ratio:2/3;display:flex;flex-direction:column;
+    justify-content:flex-end;padding:8px 7px;color:#fff;text-shadow:0 1px 1px rgba(0,0,0,.5);
+    border:1px solid rgba(255,255,255,.14);border-radius:4px;box-sizing:border-box;
+    box-shadow:0 3px 8px rgba(0,0,0,.25);overflow:hidden;}
+  #libgrid .libcover:hover{outline:2px solid var(--panel);outline-offset:1px;}
+  #libgrid .libcover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none;}
+  #libgrid .libcover.has-real img{display:block;}
+  #libgrid .libcover.has-real .g,#libgrid .libcover.has-real .t{display:none;}
+  #libdetail-cover.has-real{background:none !important;}
+  #libdetail-cover img{width:100%;height:100%;object-fit:cover;border-radius:4px;}
+  #libdetail-cover.has-real .g,#libdetail-cover.has-real .t{display:none;}
+  #libdetail-body .fact-row{display:flex;gap:8px;margin-bottom:6px;}
+  #libdetail-body .fact-label{flex:0 0 90px;color:var(--card-ink-lo);font-size:9px;text-transform:uppercase;letter-spacing:.5px;padding-top:1px;}
+  #libdetail-body .fact-val{flex:1;min-width:0;}
+  #libgrid .g{font-size:8px;letter-spacing:.5px;text-transform:uppercase;opacity:.8;}
+  #libgrid .t{font-size:11px;font-weight:bold;line-height:1.3;margin-top:4px;
+    display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;}
+  #libgrid .liba{font-size:9px;color:var(--card-ink-lo);padding:5px 2px 0;text-align:center;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  #libdetail{padding:16px;overflow-y:auto;flex:1;display:flex;gap:16px;}
+  #lib-back{align-self:flex-start;font-family:inherit;font-size:9px;padding:7px 10px;border-radius:5px;
+    border:1px solid var(--card-line);background:#fff;color:var(--card-ink);cursor:pointer;flex:0 0 auto;}
+  #libdetail-cover{width:140px;flex:0 0 140px;aspect-ratio:2/3;border-radius:5px;
+    display:flex;flex-direction:column;justify-content:flex-end;padding:10px;color:#fff;
+    text-shadow:0 1px 1px rgba(0,0,0,.5);box-sizing:border-box;box-shadow:0 4px 10px rgba(0,0,0,.3);}
+  #libdetail-cover .g{font-size:9px;text-transform:uppercase;letter-spacing:.6px;opacity:.8;}
+  #libdetail-cover .t{font-size:13px;font-weight:bold;margin-top:6px;line-height:1.3;}
+  #libdetail-meta{flex:1;min-width:0;}
+  #libdetail-title{font-size:15px;font-weight:bold;color:var(--card-ink);}
+  #libdetail-author{font-size:11px;color:var(--card-ink-lo);margin-top:3px;}
+  #libdetail-nav{display:flex;gap:6px;margin-top:12px;}
+  #libdetail-nav button{font-family:inherit;font-size:9px;padding:6px 10px;border-radius:5px;
+    border:1px solid var(--card-line);background:#fff;color:var(--card-ink);cursor:pointer;}
+  #libdetail-nav button.active{background:var(--panel);color:var(--ink-hi);border-color:var(--panel);}
+  #libdetail-body{margin-top:10px;font-size:11px;line-height:1.8;color:var(--card-ink);}
+  #libdetail-body dl{margin:0;}
+  #libdetail-body dt{font-weight:bold;color:var(--card-ink);}
+  #libdetail-body dd{margin:0 0 10px;color:var(--card-ink-lo);}
   #toast{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);background:var(--panel);
     color:var(--ink-hi);font-size:8px;padding:7px 12px;border-radius:5px;display:none;z-index:30;}
   #empty{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;
@@ -2149,6 +2231,8 @@ PAGE = r"""<!DOCTYPE html>
         <div id="tip">click a worker</div>
         <button id="sweep-kitchen" class="zonebtn" aria-label="send everyone in the kitchen to the beach" data-tip="send everyone in the kitchen to the beach">&#127958;</button>
         <button id="drown-beach" class="zonebtn" aria-label="beach" data-tip="&#128520;">&#127754;</button>
+        <button id="call-cat" class="zonebtn" aria-label="call Yumeko" data-tip="call Yumeko">&#128049;</button>
+        <button id="call-dog" class="zonebtn" aria-label="call Tom" data-tip="call Tom">&#128054;</button>
         <div id="nametag"></div>
         <div id="empty">No agents active in the last <b id="emh">24</b>h.<br/><br/>
           Start a chat in Cursor or Claude Code, or run with <b>--demo</b> to populate the office.</div>
@@ -2166,6 +2250,39 @@ PAGE = r"""<!DOCTYPE html>
               <button id="d-finish">&#127958; SEND TO BEACH</button>
               <button id="d-open">OPEN TRANSCRIPT FILE (.jsonl)</button>
               <button id="d-copy" class="ghost">COPY SESSION ID</button>
+            </div>
+          </div>
+        </div>
+        <div id="liboverlay">
+          <div id="libdialog">
+            <div id="libhead">
+              <div>
+                <div class="who">&#128218; Amit's Library</div>
+                <div class="sub" id="lib-sub"></div>
+              </div>
+              <button id="lib-x" title="close">X</button>
+            </div>
+            <div id="libtabs">
+              <button class="libtab active" data-g="all">All</button>
+              <button class="libtab" data-g="scifi">Sci-Fi</button>
+              <button class="libtab" data-g="litrpg">LitRPG</button>
+              <button class="libtab" data-g="fantasy">Fantasy</button>
+              <button class="libtab" data-g="other">Other</button>
+            </div>
+            <div id="libgrid"></div>
+            <div id="libdetail" style="display:none">
+              <button id="lib-back">&larr; Back to shelf</button>
+              <div id="libdetail-cover"></div>
+              <div id="libdetail-meta">
+                <div id="libdetail-title"></div>
+                <div id="libdetail-author"></div>
+                <div id="libdetail-nav">
+                  <button class="libdnav active" data-tab="bio">Author Bio</button>
+                  <button class="libdnav" data-tab="blurb">Details</button>
+                  <button class="libdnav" data-tab="glossary">Glossary</button>
+                </div>
+                <div id="libdetail-body"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -2323,6 +2440,12 @@ let whipFx = [];            // whip-crack particles: one lash line + shock strea
 let waterFx = [];           // water droplet particles from the cooler spout (capped, auto-expire)
 let coolerHit = null;       // {x0,y0,x1,y1,sx,sy} cooler click rect + spout origin (set each frame)
 // --- FRIDGE: click the kitchen fridge to open it; a grocery delivery restocks it daily ---
+// --- ORANGE TREE: click a ripe orange to pick it (each one regrows a bit later) ---
+let treeHit = null;         // {x0,y0,x1,y1} tree-canopy click rect (set each frame)
+const ORANGE_SPOTS = [[-9,-6],[7,-9],[-1,3],[10,2],[-11,7],[2,-2]];  // fixed fruit positions in the canopy
+const ORANGE_REGROW_MS = 45000;         // ~45s -- a fun toy pace, not a real-day wait like the fridge
+let orangesPicked = {};                 // spot-index -> performance.now() timestamp when last picked
+let orangesCollected = parseInt(localStorage.getItem('office_oranges_collected')||'0', 10) || 0;
 let fridgeHit = null;       // {x0,y0,x1,y1} fridge click rect (set each frame)
 let fridgeOpen = false;     // door state (click toggles); auto-closes after FRIDGE_AUTOCLOSE_MS
 let fridgeOpenedAt = 0;     // performance.now() when it was opened, for the auto-close
@@ -2335,6 +2458,10 @@ let fridgeStocked = (localStorage.getItem('office_fridge_stocked') === '1');
 let delivery = null;        // {start, phase} while the crate is being delivered/unpacked
 const DELIVERY_CRATE_MS = 4200;   // crate visible before it is unpacked into the fridge
 function todayKey(){ const d=new Date(); return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate(); }
+// --- BOOKSHELF: hover the wall bookshelf to see the sci-fi/LitRPG shelf (Amit's Audible list) ---
+let bookshelfHit = null;    // {x0,y0,x1,y1} bookshelf hover rect (set each frame)
+let bookshelfShown = false; // true while the (expensive, ~150-node) tooltip is already built --
+                             // only rebuild on the transition INTO the shelf, not every mousemove tick
 // --- Godzilla: stomps across the window every round hour (or on a wall-clock click) ---
 let clockHit = null;        // {x0,y0,x1,y1} wall-clock click rect (set each frame)
 let godzilla = { active:false, t:0 };   // t = 0..1 progress walking across the window
@@ -2825,6 +2952,32 @@ function bigPlant(x,y){
   [[-9,22,-12],[-6,32,-8],[-3,42,-4],[0,48,0],[3,42,4],[6,32,8],[9,24,12]]
     .forEach((d,i)=> blade(cx+d[0], y+5, d[1], d[2], (i===3)?PAL.leaf:(i%2?PAL.leaf:PAL.leafDk)));
 }
+// a little potted orange tree -- click a ripe orange to pick it (see ORANGE_SPOTS / treeHit)
+function drawOrangeTree(x,y){
+  const now=performance.now();
+  const cx=x+9, cy=y-26;                                     // canopy center
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(cx,y+16,15,4,0,0,Math.PI*2); ctx.fill();
+  // pot (reuses the same terracotta look as bigPlant)
+  px(x-1,y,20,5,shade(PAL.pot,.18));
+  px(x+1,y+5,16,5,PAL.pot); px(x+2,y+10,14,5,PAL.pot); px(x+3,y+15,12,4,shade(PAL.pot,-.10));
+  px(x+2,y+5,3,13,shade(PAL.pot,.16)); px(x+12,y+6,3,12,shade(PAL.pot,-.14));
+  px(x+1,y+4,16,2,PAL.potDk);
+  // trunk
+  px(cx-2,y-8,4,9,'#8a5a34'); px(cx-2,y-8,1,9,'#6e4626');
+  // canopy -- a rounded leafy mass, slightly two-toned for depth
+  ctx.fillStyle=PAL.leafDk; ctx.beginPath(); ctx.ellipse(cx,cy+2,20,16,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=PAL.leaf; ctx.beginPath(); ctx.ellipse(cx-3,cy-2,16,13,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,.10)'; ctx.beginPath(); ctx.ellipse(cx-7,cy-7,7,5,0,0,Math.PI*2); ctx.fill();
+  // oranges -- hidden while "picked" and still on cooldown, otherwise a bright little fruit + highlight
+  for(let i=0;i<ORANGE_SPOTS.length;i++){
+    const picked=orangesPicked[i];
+    if(picked && now-picked<ORANGE_REGROW_MS) continue;
+    const [dx,dy]=ORANGE_SPOTS[i], ox=cx+dx, oy=cy+dy;
+    px(ox-2,oy-2,4,4,'#e2841f'); px(ox-1,oy-2,2,1,'#f5b45a'); px(ox-1,oy+1,2,1,'#a85e12');
+    px(ox-2,oy-4,1,2,PAL.leafDk);                            // tiny stem/leaf nub
+  }
+  treeHit = { x0:cx-20, y0:cy-16, x1:cx+20, y1:y+16 };
+}
 function couch(x,y){ px(x,y,70,22,PAL.cabinet); px(x,y-10,70,12,'#4f6377');
   px(x-6,y-10,8,30,PAL.cabinet); px(x+68,y-10,8,30,PAL.cabinet);
   px(x+4,y+2,28,9,'#5a6e82'); px(x+38,y+2,28,9,'#5a6e82'); }
@@ -2890,13 +3043,17 @@ function drawSkyline(x,y,w,h,col,hf,step,lit,snowCap){
 //   SEASON (new)                  selects WHICH palette that mode renders + a season extra.
 //   WEATHER(new)                  a continuous 0..5 storm level that ADDS overlays on top.
 // ==========================================================================================
-const SEASON_MONTH = ['winter','winter','spring','spring','spring','summer','summer','summer','fall','fall','fall','winter'];
+// Seasons cycle on their own accelerated clock rather than the real calendar month --
+// tying it to the actual month meant it only ever changed once every 30 days, which reads
+// as "not cycling at all" for anyone actually watching the office. A full spring->summer->
+// fall->winter lap now takes SEASON_CYCLE_MS*4 (default: 4 x 10min = 40min), so it's an
+// ambient thing you can actually see happen in one sitting.
+const SEASON_ORDER = ['spring','summer','fall','winter'];
+const SEASON_CYCLE_MS = 10*60*1000;   // 10 min per season
 function currentSeason(){
   if(window.__forceSeason) return window.__forceSeason;
-  const north = localCoords()[0] >= 0;
-  let s = SEASON_MONTH[new Date().getMonth()];
-  if(!north){ const flip={winter:'summer',summer:'winter',spring:'fall',fall:'spring'}; s=flip[s]; }
-  return s;
+  const idx = Math.floor(Date.now()/SEASON_CYCLE_MS) % SEASON_ORDER.length;
+  return SEASON_ORDER[idx];
 }
 // per-season sky gradients for day/dusk, and a distinctly-tinted night, plus a skyline tint.
 // Hex literals throughout -- lerpCol only parses '#hex' (see the shade(shade()) gotcha noted
@@ -3487,6 +3644,304 @@ const QUOTES = [
   ["I work for myself, which is fun. Except when I call in sick, I know I'm lying.","Rita Rudner"],
 ];
 const QUOTE_PERIOD_MS = 600*1000;   // a fresh quote every 10 minutes
+
+// Hover the wall bookshelf to see this shelf -- Amit's ENTIRE Audible library (every unique
+// title, deduped across editions/podcasts), not just a curated pull. Genre only, no color --
+// spine color is assigned procedurally from GENRE_PAL below, since this app is a fully
+// self-contained offline server and can't fetch real cover art.
+const SHELF_BOOKS = [
+  // ---- Sci-Fi ----
+  {t:'Dune',                             a:'Frank Herbert',     g:'scifi'},
+  {t:'Hyperion',                         a:'Dan Simmons',       g:'scifi'},
+  {t:'Project Hail Mary',                a:'Andy Weir',         g:'scifi'},
+  {t:'The Three-Body Problem',          a:'Cixin Liu',         g:'scifi'},
+  {t:'The Dark Forest',                 a:'Cixin Liu',         g:'scifi'},
+  {t:"Death's End",                     a:'Cixin Liu',         g:'scifi'},
+  {t:'Ball Lightning',                  a:'Cixin Liu',         g:'scifi'},
+  {t:'The Redemption of Time',          a:'Baoshu',            g:'scifi'},
+  {t:'To Hold Up the Sky',              a:'Cixin Liu',         g:'scifi'},
+  {t:'Red Rising',                      a:'Pierce Brown',      g:'scifi'},
+  {t:'Golden Son',                      a:'Pierce Brown',      g:'scifi'},
+  {t:'Morning Star',                    a:'Pierce Brown',      g:'scifi'},
+  {t:'Iron Gold',                       a:'Pierce Brown',      g:'scifi'},
+  {t:'Speaker for the Dead',            a:'Orson Scott Card',  g:'scifi'},
+  {t:"Ender's Shadow",                  a:'Orson Scott Card',  g:'scifi'},
+  {t:'I, Robot',                        a:'Isaac Asimov',      g:'scifi'},
+  {t:"Old Man's War",                   a:'John Scalzi',       g:'scifi'},
+  {t:'The Ghost Brigades',              a:'John Scalzi',       g:'scifi'},
+  {t:'The Consuming Fire',              a:'John Scalzi',       g:'scifi'},
+  {t:'The Last Emperox',                a:'John Scalzi',       g:'scifi'},
+  {t:'The Dispatcher',                  a:'John Scalzi',       g:'scifi'},
+  {t:'Starter Villain',                 a:'John Scalzi',       g:'scifi'},
+  {t:'We Are Legion (We Are Bob)',      a:'Dennis E. Taylor',  g:'scifi'},
+  {t:'For We Are Many',                 a:'Dennis E. Taylor',  g:'scifi'},
+  {t:'All These Worlds',                a:'Dennis E. Taylor',  g:'scifi'},
+  {t:'The Singularity Trap',            a:'Dennis E. Taylor',  g:'scifi'},
+  {t:'Daemon',                          a:'Daniel Suarez',     g:'scifi'},
+  {t:'A Pale Light in the Black',       a:'K. B. Wagers',      g:'scifi'},
+  {t:'Central Station',                 a:'Lavie Tidhar',      g:'scifi'},
+  {t:'The Quantum Magician',            a:'Derek Künsken',     g:'scifi'},
+  {t:'The Quantum Garden',              a:'Derek Künsken',     g:'scifi'},
+  {t:'Pushing Ice',                     a:'Alastair Reynolds', g:'scifi'},
+  {t:'Gnomon',                          a:'Nick Harkaway',     g:'scifi'},
+  {t:'Will Destroy the Galaxy for Cash',a:'Yahtzee Croshaw',   g:'scifi'},
+  {t:'Andrea Vernon and the Corp. for UltraHuman Protection', a:'Alexander C. Kane', g:'scifi'},
+  {t:'Scum of the Earth',               a:'Alexander C. Kane', g:'scifi'},
+  {t:'Project Nemesis',                 a:'Jeremy Robinson',   g:'scifi'},
+  {t:'The Ministry for the Future',     a:'Kim Stanley Robinson', g:'scifi'},
+  {t:'The Adventures of Tom Stranger',  a:'Larry Correia',     g:'scifi'},
+  {t:'A Gift of Time',                  a:'Jerry Merritt',     g:'scifi'},
+  {t:'Fear the Sky',                    a:'Stephen Moss',      g:'scifi'},
+  {t:'Alien III',                       a:'William Gibson',    g:'scifi'},
+  {t:'Junk',                            a:'Les Bohem',         g:'scifi'},
+  {t:'An Absolutely Remarkable Thing',  a:'Hank Green',        g:'scifi'},
+  {t:'Full Throttle Savage',            a:'Jonathan Yanez',    g:'scifi'},
+  {t:'Aftermath',                       a:'Craig Alanson',     g:'scifi'},
+  {t:'Failure Mode',                    a:'Craig Alanson',     g:'scifi'},
+  {t:'Fallout',                         a:'Craig Alanson',     g:'scifi'},
+  {t:'Match Game',                      a:'Craig Alanson',     g:'scifi'},
+  {t:'Valkyrie',                        a:'Craig Alanson',     g:'scifi'},
+  {t:'Armageddon',                      a:'Craig Alanson',     g:'scifi'},
+  {t:'Renegades',                       a:'Craig Alanson',     g:'scifi'},
+  {t:'Mavericks',                       a:'Craig Alanson',     g:'scifi'},
+  {t:'Zero Hour',                       a:'Craig Alanson',     g:'scifi'},
+  {t:'Black Ops',                       a:'Craig Alanson',     g:'scifi'},
+  {t:'Paradise',                        a:'Craig Alanson',     g:'scifi'},
+  {t:'Deathtrap',                       a:'Craig Alanson',     g:'scifi'},
+  {t:'Commune: Book Four',              a:'Joshua Gayou',      g:'scifi'},
+  {t:'Commune: Book Three',             a:'Joshua Gayou',      g:'scifi'},
+  {t:'Commune: Book Two',               a:'Joshua Gayou',      g:'scifi'},
+  {t:'Hell Divers VIII',                a:'Nicholas Sansbury Smith', g:'scifi'},
+  // ---- LitRPG ----
+  {t:'Dungeon Crawler Carl',            a:'Matt Dinniman',     g:'litrpg'},
+  {t:"Carl's Doomsday Scenario",        a:'Matt Dinniman',     g:'litrpg'},
+  {t:"The Dungeon Anarchist's Cookbook",a:'Matt Dinniman',     g:'litrpg'},
+  {t:'The Gate of the Feral Gods',      a:'Matt Dinniman',     g:'litrpg'},
+  {t:"The Butcher's Masquerade",        a:'Matt Dinniman',     g:'litrpg'},
+  {t:'The Eye of the Bedlam Bride',     a:'Matt Dinniman',     g:'litrpg'},
+  {t:'This Inevitable Ruin',            a:'Matt Dinniman',     g:'litrpg'},
+  {t:'A Parade of Horribles',           a:'Matt Dinniman',     g:'litrpg'},
+  {t:'Operation Bounce House',          a:'Matt Dinniman',     g:'litrpg'},
+  {t:'He Who Fights with Monsters',     a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 2',   a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 3',   a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 4',   a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 5',   a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 6',   a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 7',   a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 8',   a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 9',   a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 10',  a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 11',  a:'Shirtaloon',        g:'litrpg'},
+  {t:'He Who Fights with Monsters 12',  a:'Shirtaloon',        g:'litrpg'},
+  {t:'One More Last Time',              a:'Eric Ugland',       g:'litrpg'},
+  {t:'Heir Today, Pawn Tomorrow',       a:'Eric Ugland',       g:'litrpg'},
+  {t:'Dungeon Mauling',                 a:'Eric Ugland',       g:'litrpg'},
+  {t:'Four: The Loot',                  a:'Eric Ugland',       g:'litrpg'},
+  {t:'Dukes and Ladders',               a:'Eric Ugland',       g:'litrpg'},
+  {t:'Home, Siege Home',                a:'Eric Ugland',       g:'litrpg'},
+  {t:'The Bare Hunt',                   a:'Eric Ugland',       g:'litrpg'},
+  {t:'Eastbound and Town',              a:'Eric Ugland',       g:'litrpg'},
+  {t:'Four Beheadings and a Funeral',   a:'Eric Ugland',       g:'litrpg'},
+  {t:'Eat, Slay, Love',                 a:'Eric Ugland',       g:'litrpg'},
+  {t:'Killing Them Awfully',            a:'Eric Ugland',       g:'litrpg'},
+  {t:'Wild Wild Quest',                 a:'Eric Ugland',       g:'litrpg'},
+  {t:'Flex in the City',                a:'Eric Ugland',       g:'litrpg'},
+  {t:'Of Slicing Men',                  a:'Eric Ugland',       g:'litrpg'},
+  {t:'Bad to the Throne',               a:'Eric Ugland',       g:'litrpg'},
+  {t:"One Man's Laughter",              a:'Eric Ugland',       g:'litrpg'},
+  {t:'Skull and Thrones',               a:'Eric Ugland',       g:'litrpg'},
+  {t:'Seas the Day',                    a:'Eric Ugland',       g:'litrpg'},
+  {t:'Back to One',                     a:'Eric Ugland',       g:'litrpg'},
+  {t:'Trick of the Night',              a:'Eric Ugland',       g:'litrpg'},
+  {t:'Darktown Funk',                   a:'Eric Ugland',       g:'litrpg'},
+  {t:'On a Throne of Lies',             a:'Eric Ugland',       g:'litrpg'},
+  {t:'2 Lies, 2 Thrones',               a:'Eric Ugland',       g:'litrpg'},
+  {t:'War of the Posers',               a:'Eric Ugland',       g:'litrpg'},
+  {t:'This Quest Is Broken',            a:'J. P. Valentine',   g:'litrpg'},
+  {t:'Beware of Chicken',               a:'Casualfarmer',      g:'litrpg'},
+  {t:'Defiance of the Fall',            a:'TheFirstDefier',    g:'litrpg'},
+  {t:'Off to Be the Wizard',            a:'Scott Meyer',       g:'litrpg'},
+  {t:"Jake's Magical Market",           a:'J.R. Mathews',      g:'litrpg'},
+  {t:'Mimic & Me',                      a:'Cassius Lange',     g:'litrpg'},
+  {t:'Monsters and Legends',            a:'Ivan Kal',          g:'litrpg'},
+  {t:'Morningwood: Everybody Loves Large Chests', a:'Neven Iliev', g:'litrpg'},
+  // ---- Fantasy ----
+  {t:'The Will of the Many',            a:'James Islington',   g:'fantasy'},
+  {t:'The Blacktongue Thief',           a:'Christopher Buehlman', g:'fantasy'},
+  {t:'The Hobbit',                      a:'J. R. R. Tolkien',  g:'fantasy'},
+  {t:'The Fellowship of the Ring',      a:'J. R. R. Tolkien',  g:'fantasy'},
+  {t:'The Two Towers',                  a:'J. R. R. Tolkien',  g:'fantasy'},
+  {t:'The Return of the King',          a:'J. R. R. Tolkien',  g:'fantasy'},
+  {t:'The Lies of Locke Lamora',        a:'Scott Lynch',       g:'fantasy'},
+  {t:'Red Seas Under Red Skies',        a:'Scott Lynch',       g:'fantasy'},
+  {t:'The Republic of Thieves',         a:'Scott Lynch',       g:'fantasy'},
+  {t:'The Final Empire',                a:'Brandon Sanderson', g:'fantasy'},
+  {t:'The Blade Itself',                a:'Joe Abercrombie',   g:'fantasy'},
+  {t:'The Sandman',                     a:'Neil Gaiman',       g:'fantasy'},
+  // ---- Everything else on the shelf (memoir / nonfiction / classics / fiction) ----
+  {t:'The Fairy Tales of Herman Hesse', a:'Hermann Hesse',     g:'other'},
+  {t:'1Q84',                            a:'Haruki Murakami',   g:'other'},
+  {t:'A Tale of Two Cities',            a:'Charles Dickens',   g:'other'},
+  {t:'Tomorrow, and Tomorrow, and Tomorrow', a:'Gabrielle Zevin', g:'other'},
+  {t:'Blood, Sweat, and Pixels',        a:'Jason Schreier',    g:'other'},
+  {t:'Crying in H Mart',                a:'Michelle Zauner',   g:'other'},
+  {t:'Never Split the Difference',      a:'Chris Voss',        g:'other'},
+  {t:'How to Change Your Mind',         a:'Michael Pollan',    g:'other'},
+  {t:'The Fountainhead',                a:'Ayn Rand',          g:'other'},
+  {t:'The Science of Sci-Fi',           a:'Erin Macdonald',    g:'other'},
+  {t:'The Minuteman',                   a:'Greg Donahue',      g:'other'},
+  {t:'Tinaca Jones',                    a:'Matt Boren',        g:'other'},
+  {t:'You Can Thank Me Later',          a:'Kelly Harms',       g:'other'},
+  {t:'Midnight Son',                    a:'James Dommek Jr.',  g:'other'},
+  {t:'How Chefs Holiday',               a:'Dana Cowin',        g:'other'},
+  {t:'The Sisters',                     a:'Dervla McTiernan',  g:'other'},
+  {t:'More Bedtime Stories for Cynics', a:'Kirsten Kearse',    g:'other'},
+];
+// spine colors are assigned procedurally (not authored per book) -- one small palette per
+// genre, cycled by how many books of that genre have been seen so far on the shelf.
+const GENRE_LABEL = {scifi:'Sci-Fi', litrpg:'LitRPG', fantasy:'Fantasy', other:'Book'};
+const GENRE_PAL = {
+  scifi:   ['#274b6d','#3e5f8a','#2f6d8f','#3f7a8a','#1f3a5c','#2b2b52','#3f3f8a','#2f5a7a','#5a5a63'],
+  litrpg:  ['#b0631f','#c9a02e','#a0551a','#8a4f1f','#b0862a','#7a8f2f','#6b8a2f','#c07a2a'],
+  fantasy: ['#3a7a5f','#2f8f6a','#4b3f7a','#6b2f5a','#2f7a8a','#7a3f8f','#3f6b3f','#5a4f7a'],
+  other:   ['#8a5a4f','#6b5a4f','#7a6b5a','#5a5a63','#8a6b3f','#6b5a7a'],
+};
+// Built ONCE at load, not per mousemove: with 140+ books this was the real perf hit -- the
+// bookshelf tooltip used to rebuild all 143 gradient/shadow'd DOM nodes from scratch on every
+// single mousemove tick while the cursor sat over the shelf (dozens of times a second), which
+// is what made hovering it janky. The HTML itself never changes, so build it exactly once.
+// one color per book, assigned once (deterministic per-genre cycling) -- shared by BOTH the
+// small hover preview and the big clickable Library grid below, so a book's spine color
+// matches between the two.
+const SHELF_BOOK_COLORS = (function(){
+  const genreSeen = {}; const out = [];
+  for(const b of SHELF_BOOKS){
+    const pal = GENRE_PAL[b.g] || GENRE_PAL.other;
+    const i = (genreSeen[b.g] = (genreSeen[b.g]||0)); genreSeen[b.g]++;
+    out.push(pal[i % pal.length]);
+  }
+  return out;
+})();
+const SHELF_BOOKS_HTML = SHELF_BOOKS.map((b,i)=>
+  '<div class="nt-book" data-idx="'+i+'" style="background:'+SHELF_BOOK_COLORS[i]+'">'+
+    '<div class="bg">'+esc(GENRE_LABEL[b.g]||'Book')+'</div>'+
+    '<div class="bt">'+esc(b.t)+'</div>'+
+    '<div class="ba">'+esc(b.a)+'</div>'+
+  '</div>').join('');
+// the full clickable Library grid (one card per book, opens the author-bio/glossary detail
+// view) -- also built once, not per open, since re-inserting ~150 nodes on every click of the
+// bookshelf would be the same needless-rebuild mistake the hover tooltip made.
+const LIB_GRID_HTML = SHELF_BOOKS.map((b,i)=>
+  '<button type="button" class="libcard" data-idx="'+i+'" data-g="'+b.g+'">'+
+    '<div class="libcover" style="background:'+SHELF_BOOK_COLORS[i]+'">'+
+      '<div class="g">'+esc(GENRE_LABEL[b.g]||'Book')+'</div>'+
+      '<div class="t">'+esc(b.t)+'</div>'+
+    '</div>'+
+    '<div class="liba">'+esc(b.a)+'</div>'+
+  '</button>').join('');
+// one short bio per author (reused across every book of theirs); a genre-level glossary
+// (NOT book-specific lore -- this app can't know a book's actual in-story terminology, so it's
+// honestly labeled as general vocabulary for the genre) rounds out the detail view.
+const AUTHOR_BIO = {
+  'Frank Herbert':'American science fiction author (1920–1986), best known for creating the Dune saga, one of the best-selling sci-fi novels of all time.',
+  'Dan Simmons':'American author who blends science fiction with literary and horror influences, most famous for the Hyperion Cantos.',
+  'Andy Weir':'American novelist and former software engineer, author of The Martian and Project Hail Mary, known for meticulously researched hard sci-fi.',
+  'Cixin Liu':'China’s most popular science fiction writer, author of the Hugo Award–winning Remembrance of Earth’s Past trilogy (The Three-Body Problem).',
+  'Baoshu':'Pen name of a Chinese author who wrote The Redemption of Time as an authorized coda to Cixin Liu’s Three-Body Problem trilogy.',
+  'Pierce Brown':'American author of the Red Rising saga, a bestselling sci-fi series blending dystopia, war, and mythology.',
+  'Orson Scott Card':'American author best known for Ender’s Game and its many sequels and spin-offs, a cornerstone of modern military sci-fi.',
+  'Isaac Asimov':'Prolific American sci-fi author (1920–1992) and one of the genre’s “Big Three,” famous for the Foundation series and the Three Laws of Robotics.',
+  'John Scalzi':'American author known for accessible, witty military and space-opera sci-fi, including Old Man’s War and The Interdependency.',
+  'Dennis E. Taylor':'Canadian author of the Bobiverse series, a self-published-turned-bestselling take on Von Neumann probes and digital consciousness.',
+  'Daniel Suarez':'American novelist and former software consultant, author of tech-thrillers like Daemon that explore AI and networked systems.',
+  'K. B. Wagers':'American author of space-opera series including the NeoG novels, blending military sci-fi with found-family stories.',
+  'Lavie Tidhar':'Israeli-British author known for genre-bending sci-fi and fantasy, including Central Station and Osama.',
+  'Derek Künsken':'Canadian author and former diplomat, known for the Quantum Evolution series exploring genetically engineered post-humans.',
+  'Alastair Reynolds':'British author and former astrophysicist, known for hard sci-fi space operas including the Revelation Space universe and Pushing Ice.',
+  'Nick Harkaway':'British novelist known for genre-blending, densely plotted books like Gnomon and The Gone-Away World.',
+  'Yahtzee Croshaw':'British-Australian critic and author, known for the Zero Punctuation game-review series and comic sci-fi novels.',
+  'Alexander C. Kane':'Author of comic/satirical sci-fi including the Andrea Vernon superhero series and Scum of the Earth.',
+  'Jeremy Robinson':'Prolific American author of techno-thrillers and kaiju/monster fiction, including the Nemesis Saga.',
+  'Kim Stanley Robinson':'American author known for hard sci-fi grounded in climate and political science, including the Mars trilogy and The Ministry for the Future.',
+  'Larry Correia':'American author known for military and urban-fantasy action series, including Monster Hunter International.',
+  'Jerry Merritt':'Author of time-travel sci-fi including A Gift of Time; also a longtime friend and collaborator of Larry Correia.',
+  'Stephen Moss':'Author of hard-sci-fi thrillers including the Fear Saga, blending real physics with first-contact stories.',
+  'William Gibson':'American-Canadian author who coined “cyberspace” and pioneered the cyberpunk genre with Neuromancer.',
+  'Les Bohem':'American screenwriter and novelist known for genre TV writing and conspiracy-thriller fiction like Junk.',
+  'Hank Green':'American author, YouTuber, and science communicator, known for the Carls duology starting with An Absolutely Remarkable Thing.',
+  'Jonathan Yanez':'Author of fast-paced military and alien-invasion sci-fi, including the Full Throttle Savage series.',
+  'Craig Alanson':'American author of the long-running Expeditionary Force series, a humor-inflected military sci-fi saga.',
+  'Joshua Gayou':'Author of the post-apocalyptic Commune series, following survivors rebuilding after civilization’s collapse.',
+  'Nicholas Sansbury Smith':'Bestselling American author of post-apocalyptic and military sci-fi series including Hell Divers.',
+  'Matt Dinniman':'American author of the Dungeon Crawler Carl series, a fast, funny LitRPG/GameLit saga that became a breakout bestseller.',
+  'Shirtaloon':'Pen name of Australian author Travis Deverell, creator of the long-running LitRPG series He Who Fights with Monsters.',
+  'Eric Ugland':'Prolific American LitRPG author behind the Good Guys and Bad Guys series, known for a huge, fast-paced back catalog.',
+  'J. P. Valentine':'Author of comedic LitRPG including This Quest Is Broken, poking fun at classic fantasy-quest tropes.',
+  'Casualfarmer':'Pen name of the author behind Beware of Chicken, a laid-back xianxia-cultivation/LitRPG hybrid series.',
+  'TheFirstDefier':'Pen name of the author behind Defiance of the Fall, a long-running progression-fantasy LitRPG series.',
+  'Scott Meyer':'American author and cartoonist known for the comic, LitRPG-adjacent Magic 2.0 series, starting with Off to Be the Wizard.',
+  'J.R. Mathews':'Indie author of the post-apocalyptic LitRPG series Jake’s Magical Market.',
+  'Cassius Lange':'Co-author (with Ryan Tang) of the LitRPG series Mimic & Me.',
+  'Ivan Kal':'Indie author of the Infinite Realm series, a post-apocalyptic LitRPG saga.',
+  'Neven Iliev':'Pen name of the author behind Everybody Loves Large Chests, a popular (and cheekily titled) LitRPG series.',
+  'James Islington':'Australian fantasy author known for the Licanius trilogy and the Hierarchy series, starting with The Will of the Many.',
+  'Christopher Buehlman':'American author and poet known for atmospheric, dark fantasy and horror, including The Blacktongue Thief.',
+  'J. R. R. Tolkien':'English author and philologist (1892–1973), creator of Middle-earth and author of The Hobbit and The Lord of the Rings.',
+  'Scott Lynch':'American author of the Gentleman Bastard Sequence, a heist-driven fantasy series starting with The Lies of Locke Lamora.',
+  'Brandon Sanderson':'Prolific American fantasy author known for intricate magic systems, including the Mistborn and Stormlight Archive series.',
+  'Joe Abercrombie':'British author known for gritty, morally grey epic fantasy including The First Law trilogy.',
+  'Neil Gaiman':'British author known for genre-blending fantasy and horror, including The Sandman, American Gods, and Coraline.',
+  'Hermann Hesse':'German-Swiss author and Nobel laureate (1946), known for introspective novels like Siddhartha and Steppenwolf, and for his fairy tales.',
+  'Haruki Murakami':'Japanese novelist known for surreal, genre-blending fiction including 1Q84, Kafka on the Shore, and Norwegian Wood.',
+  'Charles Dickens':'English novelist (1812–1870), one of the most celebrated writers of the Victorian era, author of A Tale of Two Cities and Great Expectations.',
+  'Gabrielle Zevin':'American novelist known for Tomorrow, and Tomorrow, and Tomorrow, a bestseller about friendship and video-game design.',
+  'Jason Schreier':'American journalist covering the video game industry, author of Blood, Sweat, and Pixels.',
+  'Michelle Zauner':'American musician (Japanese Breakfast) and writer, author of the memoir Crying in H Mart.',
+  'Chris Voss':'Former FBI lead international hostage negotiator, author of the negotiation guide Never Split the Difference.',
+  'Michael Pollan':'American journalist and author known for food and consciousness writing, including How to Change Your Mind.',
+  'Ayn Rand':'Russian-American writer and philosopher (1905–1982), known for The Fountainhead and Atlas Shrugged and for developing Objectivism.',
+  'Erin Macdonald':'Astrophysicist and science consultant for Star Trek, author/narrator of The Science of Sci-Fi.',
+  'Greg Donahue':'Journalist and author of narrative nonfiction including The Minuteman.',
+  'Matt Boren':'Actor and writer known for the audio drama Tinaca Jones.',
+  'Kelly Harms':'American novelist known for contemporary women’s fiction, including You Can Thank Me Later.',
+  'James Dommek Jr.':'Alaska Native writer and musician, co-creator of the true-crime audio series Midnight Son.',
+  'Dana Cowin':'Former editor-in-chief of Food & Wine magazine, host of the interview series How Chefs Holiday.',
+  'Dervla McTiernan':'Irish-Australian author of the Cormac Reilly crime series, including the prequel novella The Sisters.',
+  'Kirsten Kearse':'One of several comedy writers credited on More Bedtime Stories for Cynics, a dark-comedy anthology narrated by Nick Offerman.',
+};
+const GENRE_GLOSSARY = {
+  scifi: [
+    ['FTL','Faster-than-light travel -- the hand-wave every space opera needs to get characters between stars in a readable timeframe.'],
+    ['Terraforming','Engineering a planet’s atmosphere and climate to make it human-habitable.'],
+    ['Cryosleep','Suspended animation used to survive long voyages or hard-to-treat injuries.'],
+    ['Singularity','The hypothetical point where AI/technological growth becomes uncontrollable and irreversible.'],
+    ['Generation ship','A vessel slow enough that the crew who arrive are descendants of the crew who departed.'],
+    ['Xenobiology','The study of alien life -- its biology, ecology, and (often) how to weaponize or befriend it.'],
+  ],
+  litrpg: [
+    ['The System','The game-like ruleset (levels, stats, notifications) that has been overlaid onto reality or a fictional world.'],
+    ['Status Window','The pop-up stat sheet a character can pull up showing HP, stats, skills, and inventory.'],
+    ['Class','A character’s build/role (e.g. Warrior, Mage) that shapes which skills and stats they can grow.'],
+    ['Level Up','Gaining enough experience to increase a character’s stats and unlock new abilities.'],
+    ['Dungeon Core','The intelligence (or artifact) that generates and governs a dungeon’s monsters and loot.'],
+    ['Progression fantasy','The broader genre umbrella LitRPG sits inside: stories built around a character visibly growing more powerful.'],
+  ],
+  fantasy: [
+    ['Magic system','The rules governing how magic works in a story -- “hard” systems are rule-bound, “soft” ones stay mysterious.'],
+    ['Worldbuilding','The invented history, geography, cultures, and rules an author builds beneath the plot.'],
+    ['Grimdark','A subgenre defined by a bleak, morally grey, often violent tone.'],
+    ['Epic fantasy','Fantasy on a large scale -- sprawling casts, multi-book arcs, world-shaking stakes.'],
+    ['Guild/Order','A structured organization (thieves, mages, knights) a story’s cast belongs to or fights against.'],
+    ['Prophecy','A foretold future event a fantasy plot often revolves around fulfilling, subverting, or misreading.'],
+  ],
+  other: [
+    ['Memoir','A first-person account of the author’s own life or a specific period/experience within it.'],
+    ['Literary fiction','Fiction valued primarily for its prose style and characters over plot or genre convention.'],
+    ['Nonfiction','Writing grounded in real events, research, or argument rather than invented story.'],
+    ['Classic','A work that has remained widely read and influential well beyond its own era.'],
+  ],
+};
 // greedy word-wrap to a pixel width for the given canvas font
 function wrapText(text, maxW, font){
   ctx.font=font;
@@ -3551,6 +4006,8 @@ function drawWallDecor(x, y, clkL, shfL){
     px(shx+2,ry+13,42,2,PAL.woodDk);
   }
   smallPlant(shx+30, shy-2);
+  // hover this whole shelf -> a sci-fi/LitRPG book-cover tooltip (see mousemove handler)
+  bookshelfHit = { x0:shx-4, y0:shy-4, x1:shx+48, y1:shy+52 };
 }
 
 function drawOfficeProps(){
@@ -3569,6 +4026,7 @@ function drawOfficeProps(){
   const wcx=W-56, wcy=lastDeskY+48; ro(wcx,wcy,18,30,PAL.steel); px(wcx+2,wcy-15,14,15,'#9fd9f0'); px(wcx+5,wcy+14,8,5,PAL.cabinet);
   coolerHit = { x0:wcx-3, y0:wcy-16, x1:wcx+19, y1:wcy+31, sx:wcx+5, sy:wcy+18 };   // click rect + spout origin
   bigPlant(34, lastDeskY+44);
+  drawOrangeTree(112, lastDeskY+44);
 }
 
 // ---- daily grocery delivery: a crate is set down beside the fridge, sits a moment, then
@@ -4966,6 +5424,7 @@ function render(t){
   people.filter(p=> p.kind!=='work' || !p.seated || p.ovf).forEach(p=> drawList.push({y:p.y, p}));
   if(amb.dog) drawList.push({y:amb.dog.y, dog:amb.dog});
   if(amb.cat) drawList.push({y:amb.cat.y, cat:amb.cat});
+  if(amb.croc) drawList.push({y:amb.croc.y, croc:amb.croc});
   drawList.sort((a,b)=>a.y-b.y);
   for(const e of drawList){
     if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
@@ -4994,6 +5453,7 @@ function render(t){
       if(e.p.bubbleUntil>bt && !bossActive(e.p.id)) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil, tool:e.p.bubbleTool}); }
     else if(e.dog) drawDog(e.dog, t);
     else if(e.cat) drawCat(e.cat, t);
+    else if(e.croc) drawCroc(e.croc, t);
   }
   // supervisor "boss" visits: a stern suited figure delivering a fresh user instruction.
   // The boss ESCORTS the agent -- it appears the moment the instruction lands and walks
@@ -5314,7 +5774,7 @@ function schedulePlane(now){
 // pick ONE event at random, avoiding an immediate repeat; if the chosen type can't
 // run (dog/cat already on screen, or no waiting agent for a relocate) try another.
 function fireRandomEvent(now){
-  const types=[1,2,3,4];
+  const types=[1,2,3,4,5];
   for(let i=types.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; const tmp=types[i]; types[i]=types[j]; types[j]=tmp; }
   if(types[0]===lastEventType){ types.push(types.shift()); }   // soft anti-repeat
   for(const t of types){
@@ -5322,6 +5782,7 @@ function fireRandomEvent(now){
     if(t===2 && !amb.cat){ startCat(now); lastEventType=2; return; }
     if(t===3 && startRelocate(now)){ lastEventType=3; return; }
     if(t===4 && startAgentPet(now)){ lastEventType=4; return; }
+    if(t===5 && !amb.croc){ startCroc(now); lastEventType=5; return; }
   }
 }
 
@@ -5516,6 +5977,7 @@ function updateDogCatMeet(d, now, sec){
 // furniture, rub against people/things) before eventually napping and leaving --
 // same outer envelope (in -> active -> napwalk -> sleep -> out) driven by
 // updateAmbient, with the "active" phase itself a small behavior FSM below.
+const PET_NAMES = {cat:'Yumeko', dog:'Tom'};                // the office pets, by name
 const CAT_FUR = '#d9a441';                                 // Bengal base coat (warm gold/tan)
 const CAT_SPOTS=[[490,556],[300,478],[200,556],[410,556]]; // established safe nap/roam floor spots, clear of furniture
 const CAT_BEHAVIOR_WEIGHTS = {roam:3, eat:1, drink:1, poop:0.6, chase:2, lap:1.4, perch:1.4, rub:1.6};
@@ -5660,6 +6122,15 @@ function updateCatBehavior(c, now, sec){
 }
 
 // ---- a tiny airliner drifts across the WINDOW sky, above the buildings, near the clouds ----
+// ---- the office crocodile: a pink crocodile in a heart-print dress, just passing through ----
+function startCroc(now){
+  const dir = Math.random()<0.5 ? 1 : -1;
+  amb.croc = {
+    dir, x: dir>0 ? -34 : W+34,
+    y: layout().kitchenTop - 20,               // same front-office lane the dog crosses
+    spd: 46 + Math.random()*14,
+  };
+}
 function startPlane(now){
   const dir = Math.random()<0.5 ? 1 : -1;               // 1: L->R, -1: R->L
   amb.plane = {
@@ -5697,6 +6168,10 @@ function updateAmbient(now, dt){
   if(!nextEventAt) scheduleNextEvent(now);          // first event ~30-60s after load
   if(now>=nextEventAt){ fireRandomEvent(now); scheduleNextEvent(now); }
   const sec=dt/1000;
+  if(amb.croc){ const cr=amb.croc;                  // just strolls straight across and off
+    cr.x += cr.dir*cr.spd*sec;
+    if((cr.dir>0 && cr.x>W+40) || (cr.dir<0 && cr.x<-40)) amb.croc=null;
+  }
   if(amb.dog){ const d=amb.dog;
     if(d.mode==='cross'){
       // ORIGINAL crossing logic, byte-for-byte unchanged -- the zero-regression path.
@@ -5776,6 +6251,13 @@ function updateAmbient(now, dt){
 
 // a single shaded leg segment
 function _leg(lx, topY, len, w, col){ px(lx,topY,w,len,col); px(lx,topY+len-1,w,1,shade(col,-.34)); }
+// a tiny blocky pixel-art heart, for the crocodile's dress print
+function pixHeart(x,y,col){
+  px(x-1,y,1,1,col); px(x+1,y,1,1,col);
+  px(x-2,y+1,5,1,col);
+  px(x-1,y+2,3,1,col);
+  px(x,y+3,1,1,col);
+}
 
 // AIRLINER: a tiny plane drifting across the window sky. Drawn in absolute window
 // coords at logical scale (no SC), mirrored to face its heading, with a faint contrail.
@@ -5996,8 +6478,13 @@ function drawDogBow(d, t, pal){
 // it would flicker like noise instead of reading as one cat's actual coat). Small
 // dark blotches scattered over the body/head, plus a light chest/belly patch and the
 // two dark cheek/forehead "M" lines every Bengal has.
-const BENGAL_BODY_SPOTS = [[-11,-4,3,2],[-3,-6,2.5,2],[5,-5,3,2],[-7,0,2.5,2],[2,1,3,2],[10,-1,2,2],[-13,2,2,2]];
-const BENGAL_HEAD_SPOTS = [[-3,-1,1.6,1.3],[3,-2,1.6,1.3]];
+// NOTE: these offsets are constrained to actually sit inside the cat's drawn body/head
+// silhouette across every pose that reuses this one array (walking ~18x7, eat/drink
+// ~18x6, rub ~18x7, head boxes ~9-11 wide x 8-10 tall) -- the old values (e.g. dx=-13,
+// dy=-4 on an 18-wide/7-tall body) stuck out well past the actual silhouette, which is
+// what caused spots to visibly float off the cat.
+const BENGAL_BODY_SPOTS = [[-6,-1.5,2.0,1.4],[-3,-0.5,2.2,1.5],[0,-1.6,2.0,1.4],[3,-0.6,2.2,1.5],[6,-1.2,1.8,1.3],[-4,1.0,1.8,1.3],[2,1.0,2.0,1.4]];
+const BENGAL_HEAD_SPOTS = [[3,2.2,1.3,1.0],[6,3.2,1.3,1.0]];
 function drawBengalMarkings(el, x, y, dir, furDk, cream){
   // body rosettes (mirrored if facing left, since offsets are authored facing right)
   for(const [dx,dy,rx,ry] of BENGAL_BODY_SPOTS) el(x+dx*dir, y+dy, rx, ry, furDk);
@@ -6010,6 +6497,35 @@ function drawBengalFace(el, px, hx, hy, dir, furDk, cream){
   px(hx-1, hy-6, 1, 2, furDk); px(hx+2, hy-6, 1, 2, furDk);   // faint forehead "M" mark
 }
 
+function drawCroc(c, t){
+  ctx.save();
+  scaleAbout(c.x, c.y, SC);
+  const x=c.x, y=c.y;
+  const body='#f2a8c4', bodyDk=shade(body,-.28), bodyHi=shade(body,.22), belly='#fbd7e4';
+  const bob=Math.sin(t*0.35)*1;
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x, y+2, 24, 4, 0, 0, Math.PI*2); ctx.fill();
+  ctx.save();
+  if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }  // face walk dir
+  const ph=(Math.floor(t*0.5)&1)?1:-1;                            // short stumpy legs, waddling
+  _leg(x-12,y-4,5+ph,4,bodyDk); _leg(x-3,y-4,5-ph,4,bodyDk);
+  _leg(x+7,y-4,5-ph,4,bodyDk); _leg(x+15,y-4,5+ph,4,bodyDk);
+  px(x-22,y-9+bob,10,5,body); px(x-22,y-9+bob,10,1,bodyHi);       // tail
+  ro(x-12,y-11+bob,26,7,body); px(x-12,y-11+bob,26,2,bodyHi);     // long low body
+  px(x-10,y-6+bob,20,2,belly);                                    // pale belly stripe
+  const hx=x+12, hy=y-13+bob;                                     // long snout, eyes on top (croc-style)
+  ro(hx, hy, 16, 6, body);
+  px(hx+13, hy+1, 3, 2, bodyDk);                                  // nostril bump
+  px(hx-2, hy-3, 7, 4, body);                                     // brow ridge
+  px(hx, hy-3, 2, 2, PAL.outline); px(hx+4, hy-3, 2, 2, PAL.outline);   // two small eyes on top
+  px(hx+15, hy+3, 2, 1, '#ffffff');                               // a little tooth peeking out
+  // dress covered in hearts, worn over the body
+  ro(x-11, y-10+bob, 22, 6, '#e6547d');
+  pixHeart(x-6, y-9+bob, '#ffffff'); pixHeart(x, y-8+bob, '#ffffff'); pixHeart(x+6, y-9+bob, '#ffffff');
+  // a little white apron over the front of the dress
+  px(x-2, y-7+bob, 8, 4, '#ffffff'); px(x-2, y-4+bob, 8, 1, '#e7e7ef');
+  ctx.restore();
+  ctx.restore();
+}
 function drawCat(c, t){
   ctx.save();
   scaleAbout(c.x, c.y, SC);
@@ -6224,16 +6740,36 @@ function dispenseDrink(s){
   vendDrops[s.idx]={start:performance.now(), col:s.col, fromX:s.bxv, fromY:s.ry}; }
 cv.addEventListener('mousemove', e=>{
   const m=toCanvas(e);
+  if(bookshelfShown && !inHit(bookshelfHit,m.x,m.y)) bookshelfShown=false;   // left the shelf -> rebuild next time
   // a pettable pet under the cursor?
   const pet=pickPet(m.x,m.y);
   if(pet){ hover=null; cv.style.cursor='pointer';
-    nametag.innerHTML='<div class="nt-hint">click to pet the '+pet+'</div>';
+    nametag.innerHTML='<div class="nt-hint">click to pet '+PET_NAMES[pet]+'</div>';
     nametag.style.display='block'; placeNametag(m); return; }
   // a vending-machine drink? (click drops it into the tray)
   const vs=pickVend(m.x,m.y);
   if(vs){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
   // clickable props -- pointer cursor only, no tooltip (discover them by clicking)
-  if(inHit(coolerHit,m.x,m.y) || inHit(clockHit,m.x,m.y) || inHit(fridgeHit,m.x,m.y)){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
+  if(inHit(coolerHit,m.x,m.y) || inHit(clockHit,m.x,m.y) || inHit(fridgeHit,m.x,m.y) || inHit(treeHit,m.x,m.y)){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
+  // the bookshelf: a hover preview of Amit's whole Audible library; CLICK it to open the
+  // full browsable Library (grid of covers + author bio / glossary -- see openLibrary()).
+  // The 143-book HTML is PRECOMPUTED (SHELF_BOOKS_HTML, built once at load) and only ever
+  // assigned to innerHTML once per hover (not on every mousemove tick) -- reassigning ~150
+  // gradient/shadow'd DOM nodes on every pixel of mouse movement was the actual perf hit.
+  if(inHit(bookshelfHit,m.x,m.y)){
+    hover=null; cv.style.cursor='pointer';
+    if(!bookshelfShown){
+      bookshelfShown=true;
+      nametag.innerHTML =
+        '<div class="nt-name">Bookshelf<span class="nt-badge workflow">'+SHELF_BOOKS.length+' books</span></div>'+
+        '<div class="nt-meta">Amit’s whole Audible library, spine by spine</div>'+
+        '<div class="nt-books">'+SHELF_BOOKS_HTML+'</div>'+
+        '<div class="nt-hint">click to browse the full library</div>';
+      hydrateHoverCovers();
+    }
+    nametag.style.display='block'; placeNametag(m);
+    return;
+  }
   // a workflow tent? (takes precedence over helpers)
   const wf=pickWorkflow(m.x,m.y);
   if(wf){
@@ -6343,6 +6879,20 @@ cv.addEventListener('click', e=>{
     fridgeOpen=!fridgeOpen; fridgeOpenedAt=performance.now();
     if(fridgeOpen) toast(fridgeStocked ? 'fridge: fully stocked' : 'fridge: pretty empty…');
     return; }
+  if(inHit(bookshelfHit,m.x,m.y)){ openLibrary(); return; }                // bookshelf -> open the Library
+  if(inHit(treeHit,m.x,m.y)){                                              // orange tree -> pick a ripe orange
+    const now=performance.now(); let picked=false;
+    for(let i=0;i<ORANGE_SPOTS.length;i++){
+      if(!orangesPicked[i] || now-orangesPicked[i]>=ORANGE_REGROW_MS){
+        orangesPicked[i]=now; picked=true;
+        orangesCollected++; localStorage.setItem('office_oranges_collected', orangesCollected);
+        toast('🍊 picked an orange! ('+orangesCollected+' so far)');
+        break;
+      }
+    }
+    if(!picked) toast('no ripe oranges right now -- they regrow soon');
+    return;
+  }
   const pet=pickPet(m.x,m.y);                 // pet the dog/cat before opening any worker
   if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
   const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray
@@ -6445,6 +6995,146 @@ function closeDetail(){overlay.style.display='none';currentDetail=null;}
 document.getElementById('d-x').addEventListener('click',closeDetail);
 overlay.addEventListener('click',e=>{ if(e.target===overlay) closeDetail(); });
 document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeDetail(); });
+
+// ---- the Library: click the bookshelf -> a grid of every book cover, click a cover -> ----
+// ---- author bio / genre glossary, filterable by genre, scrollable for the rest        ----
+const liboverlay = document.getElementById('liboverlay');
+const libgrid = document.getElementById('libgrid');
+const libdetail = document.getElementById('libdetail');
+let libGridBuilt = false;   // build the ~150-card grid once, not on every open
+let libDetailIdx = null, libDetailTab = 'bio';
+
+// ---- real cover art + factual bibliographic details -- served ENTIRELY LOCALLY, no ----
+// ---- internet access needed at runtime                                             ----
+// scripts/fetch_covers.py did the one-time fetch (from Open Library, a free/keyless/nonprofit
+// API meant exactly for this) and saved cover images + metadata under agent-office/covers/;
+// cursor_office.py's Handler serves that directory at /covers/. So all the running app does
+// is read a local JSON file and local image files -- same-origin, works fully offline.
+// Deliberately does NOT store/show any book description/jacket-copy prose -- only the cover
+// image and plain bibliographic facts (publisher, year, page count, subject tags, rating).
+let coverMeta = null, coverMetaPromise = null;
+function loadCoverMeta(){
+  if(coverMeta) return Promise.resolve(coverMeta);
+  if(coverMetaPromise) return coverMetaPromise;
+  coverMetaPromise = fetch('/covers/meta.json')
+    .then(r=>r.ok ? r.json() : {})
+    .catch(()=>({}))
+    .then(d=>{ coverMeta = d; return d; });
+  return coverMetaPromise;
+}
+function applyCoverImage(i){
+  const card = libgrid.querySelector('.libcard[data-idx="'+i+'"]'); if(!card) return;
+  const cover = card.querySelector('.libcover'); if(!cover || cover.querySelector('img')) return;
+  // NOTE: no loading='lazy' here -- setting it on a same-origin Image() BEFORE it's attached
+  // to the DOM confuses the lazy-load heuristic in some engines and the image never actually
+  // loads. These are tiny local files served from localhost, so there's no real cost to just
+  // loading them immediately.
+  const img = new Image(); img.alt='';
+  img.onload = ()=>cover.classList.add('has-real');
+  img.onerror = ()=>img.remove();
+  img.src = '/covers/'+i+'.jpg'; cover.appendChild(img);
+  if(libDetailIdx===i) applyDetailCoverImage(i);   // detail view open on this book right now? update it live
+}
+function applyDetailCoverImage(i){
+  const cover = document.getElementById('libdetail-cover');
+  if(cover.querySelector('img')) return;
+  const img = new Image(); img.alt='';
+  img.onload = ()=>cover.classList.add('has-real');
+  img.onerror = ()=>img.remove();
+  img.src = '/covers/'+i+'.jpg'; cover.appendChild(img);
+}
+function hydrateCovers(){
+  loadCoverMeta().then(meta=>{
+    SHELF_BOOKS.forEach((b,i)=>{ if(meta[String(i)] && meta[String(i)].ok) applyCoverImage(i); });
+  });
+}
+// same idea, for the small hover-preview shelf (see bookshelfShown in the mousemove handler) --
+// applied once per hover-session, not per mousemove tick, same perf reasoning as the tooltip
+// HTML itself.
+function applyHoverCoverImage(i){
+  const el = nametag.querySelector('.nt-book[data-idx="'+i+'"]'); if(!el || el.querySelector('img')) return;
+  const img = new Image(); img.alt='';
+  img.onload = ()=>el.classList.add('has-real');
+  img.onerror = ()=>img.remove();
+  img.src = '/covers/'+i+'.jpg'; el.appendChild(img);
+}
+function hydrateHoverCovers(){
+  loadCoverMeta().then(meta=>{
+    SHELF_BOOKS.forEach((b,i)=>{ if(meta[String(i)] && meta[String(i)].ok) applyHoverCoverImage(i); });
+  });
+}
+
+function openLibrary(){
+  if(!libGridBuilt){ libgrid.innerHTML = LIB_GRID_HTML; libGridBuilt = true; hydrateCovers(); }
+  document.getElementById('lib-sub').textContent = SHELF_BOOKS.length+' books -- click a cover for its author bio & details';
+  libdetail.style.display='none'; libgrid.style.display='grid';
+  liboverlay.style.display='flex';
+}
+function closeLibrary(){ liboverlay.style.display='none'; }
+document.getElementById('lib-x').addEventListener('click', closeLibrary);
+liboverlay.addEventListener('click', e=>{ if(e.target===liboverlay) closeLibrary(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape' && liboverlay.style.display==='flex') closeLibrary(); });
+// genre filter chips -- toggle visibility rather than rebuild the grid
+document.getElementById('libtabs').addEventListener('click', e=>{
+  const btn=e.target.closest('.libtab'); if(!btn) return;
+  document.querySelectorAll('#libtabs .libtab').forEach(b=>b.classList.toggle('active', b===btn));
+  const g=btn.dataset.g;
+  libgrid.querySelectorAll('.libcard').forEach(el=>{ el.style.display = (g==='all'||el.dataset.g===g) ? '' : 'none'; });
+});
+// click a cover -> the detail view (author bio / details / glossary, switchable via its own nav)
+libgrid.addEventListener('click', e=>{
+  const card=e.target.closest('.libcard'); if(!card) return;
+  libDetailIdx = parseInt(card.dataset.idx, 10); libDetailTab = 'bio';
+  const b = SHELF_BOOKS[libDetailIdx];
+  const cover = document.getElementById('libdetail-cover');
+  cover.className = ''; cover.style.background = SHELF_BOOK_COLORS[libDetailIdx];
+  cover.innerHTML = '<div class="g">'+esc(GENRE_LABEL[b.g]||'Book')+'</div><div class="t">'+esc(b.t)+'</div>';
+  const cachedEntry = coverMeta && coverMeta[String(libDetailIdx)];
+  if(cachedEntry && cachedEntry.ok) applyDetailCoverImage(libDetailIdx);
+  document.getElementById('libdetail-title').textContent = b.t;
+  document.getElementById('libdetail-author').textContent = 'by '+b.a;
+  document.querySelectorAll('#libdetail-nav button').forEach(btn=>btn.classList.toggle('active', btn.dataset.tab==='bio'));
+  renderLibDetailBody();
+  libgrid.style.display='none'; libdetail.style.display='flex';
+});
+function renderLibDetailBody(){
+  const b = SHELF_BOOKS[libDetailIdx];
+  const body = document.getElementById('libdetail-body');
+  if(libDetailTab==='bio'){
+    body.innerHTML = '<p>'+esc(AUTHOR_BIO[b.a] || ('No bio on file yet for '+b.a+'.'))+'</p>';
+  } else if(libDetailTab==='blurb'){
+    const m = coverMeta && coverMeta[String(libDetailIdx)];
+    if(!m || !m.ok){
+      body.innerHTML = '<p style="color:var(--card-ink-lo)">No catalog data found for this edition (no match in Open Library).</p>';
+    } else {
+      const rows = [
+        ['Publisher', m.publisher],
+        ['Published', m.publishedDate],
+        ['Pages', m.pageCount],
+        ['Categories', m.categories && m.categories.join(', ')],
+        ['Rating', m.avgRating ? (m.avgRating+' / 5'+(m.ratingsCount?' ('+m.ratingsCount+' ratings)':'')) : null],
+      ].filter(r=>r[1]);
+      body.innerHTML = rows.length
+        ? rows.map(r=>'<div class="fact-row"><div class="fact-label">'+esc(r[0])+'</div><div class="fact-val">'+esc(String(r[1]))+'</div></div>').join('')
+        : '<p style="color:var(--card-ink-lo)">No catalog details available for this edition.</p>';
+    }
+  } else {
+    const terms = GENRE_GLOSSARY[b.g] || GENRE_GLOSSARY.other;
+    body.innerHTML =
+      '<div style="font-size:9px;letter-spacing:.5px;text-transform:uppercase;color:var(--card-ink-lo);margin-bottom:8px">'+
+        'General '+esc(GENRE_LABEL[b.g]||'')+' glossary (genre vocabulary, not this book’s specific lore)</div>'+
+      '<dl>'+terms.map(t=>'<dt>'+esc(t[0])+'</dt><dd>'+esc(t[1])+'</dd>').join('')+'</dl>';
+  }
+}
+document.getElementById('libdetail-nav').addEventListener('click', e=>{
+  const btn=e.target.closest('button'); if(!btn) return;
+  libDetailTab = btn.dataset.tab;
+  document.querySelectorAll('#libdetail-nav button').forEach(b=>b.classList.toggle('active', b===btn));
+  renderLibDetailBody();
+});
+document.getElementById('lib-back').addEventListener('click', ()=>{
+  libdetail.style.display='none'; libgrid.style.display='grid';
+});
 
 // mark / unmark an agent as "finished" -> it walks to the beach (or back to work)
 function updateFinishBtn(id){
@@ -6566,6 +7256,33 @@ document.getElementById('drown-beach').addEventListener('click',()=>{
     p.drownTo = { x: SHORE_X + Math.round(WATER_W*0.5), y: p.y };   // wade out into the ocean band
   });
   toast('🌊 glug glug...');
+});
+// CALL YUMEKO / CALL TOM: summon the pet if it's off-screen, or just bring it over (and
+// wake it up) if it's already somewhere in the office.
+document.getElementById('call-cat').addEventListener('click', ()=>{
+  if(amb.cat){
+    const c=amb.cat;
+    c.tx = Math.max(40, Math.min(W-40, W/2 + (Math.random()<0.5?-40:40)));
+    c.ty = c.napSpot ? c.napSpot[1] : c.y;
+    c.state='in'; c.react=null; c.sleepUntil=0; c.encounter=null;
+    toast('here, Yumeko! 🐱');
+  } else {
+    startCat(performance.now());
+    toast('Yumeko is coming! 🐱');
+  }
+});
+document.getElementById('call-dog').addEventListener('click', ()=>{
+  if(amb.dog){
+    const d=amb.dog;
+    d.mode='visit';
+    d.tx = Math.max(40, Math.min(W-40, W/2 + (Math.random()<0.5?-40:40)));
+    d.ty = layout().kitchenTop - 24;
+    d.state='in'; d.sleepUntil=0;
+    toast('here, Tom! 🐶');
+  } else {
+    startDog(performance.now());
+    toast('Tom is coming! 🐶');
+  }
 });
 
 let toastT=null;
@@ -6860,6 +7577,23 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(404, {"error": "not found"})
                     return
                 self._send(200, detail)
+                return
+            if path.startswith("/covers/"):
+                # Local-only static file serving for pre-fetched book cover art + its
+                # metadata JSON (see scripts/fetch_covers.py) -- deliberately NOT a generic
+                # static-file server: only a bare filename directly under COVERS_DIR, so a
+                # "../../etc/passwd"-style path can never escape that one directory.
+                name = unquote(path[len("/covers/"):])
+                if "/" in name or "\\" in name or name in ("", ".", ".."):
+                    self._send(404, {"error": "not found"})
+                    return
+                fp = os.path.join(COVERS_DIR, name)
+                if not os.path.isfile(fp):
+                    self._send(404, {"error": "not found"})
+                    return
+                ctype = "application/json" if name.endswith(".json") else "image/jpeg"
+                with open(fp, "rb") as fh:
+                    self._send(200, fh.read(), ctype)
                 return
             self._send(404, {"error": "not found"})
         except BrokenPipeError:
