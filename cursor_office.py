@@ -6017,6 +6017,79 @@ function updateDogCatMeet(d, now, sec){
 // same outer envelope (in -> active -> napwalk -> sleep -> out) driven by
 // updateAmbient, with the "active" phase itself a small behavior FSM below.
 const PET_NAMES = {cat:'Yumeko', dog:'Tom'};                // the office pets, by name
+// a fixed, funny bio for each pet -- shown on hover, the same way a human worker's
+// tooltip shows their real project/task. Purely flavor text, written once, not per-render.
+const PET_BIO = {
+  cat: "Found as a kitten inside a returned Amazon box marked FRAGILE (she was the fragile part). Yumeko has since appointed herself Head of Office Surveillance, Snack Auditing, and Reluctant Affection.",
+  dog: "Tom washed out of therapy-dog school for \"excessive joy.\" He has never once caught the ball, the mouse, or his own tail, and considers all three ongoing projects rather than failures.",
+};
+// per-current-state flavor: an objective "Currently" line + a pool of funny first-person
+// "Thinking" lines. Keyed to line up with the real FSM state/behavior each pet is actually
+// in, so the tooltip is honest about what's happening on screen (just narrated for laughs).
+const PET_MOOD = {
+  cat: {
+    in:           {action:'strolling in',                      thoughts:["Here to audit the snack situation.","I have arrived. You may applaud quietly."]},
+    active_roam:  {action:'roaming the office',                 thoughts:["Patrolling my kingdom.","Everything here is mine, I just haven't told you yet.","This floor? Also mine."]},
+    active_eat:   {action:'inhaling kibble',                    thoughts:["Do not interrupt fine dining.","Ten stars, would eat again immediately."]},
+    active_drink: {action:'noisily hydrating',                  thoughts:["The bowl moved. I fixed it by staring at it.","Hydration: a personal brand."]},
+    active_poop:  {action:'using the litter box',                thoughts:["Please look away, this is a private moment.","...and stay away."]},
+    active_chase: {action:'hunting a Very Important Toy',        thoughts:["It moved. It must die.","I am an apex predator (of felt mice)."]},
+    active_lap:   {action:'colonizing a lap',                    thoughts:["This human is now a chair.","Do not get up. I will renegotiate."]},
+    active_perch: {action:'surveilling from up high',            thoughts:["Excellent vantage point for judging everyone.","I see you not doing your job."]},
+    active_rub:   {action:'marking territory (affectionately)',  thoughts:["You are now legally mine.","Rubbing intensifies."]},
+    napwalk:      {action:'scouting a nap spot',                 thoughts:["The perfect nap requires research.","Location, location, location."]},
+    sleep:        {action:'napping',                             thoughts:["Do not wake the queen.","Dreaming of forklifts, probably."]},
+    out:          {action:'heading out',                         thoughts:["Places to be. Mice to reconsider.","I'll be back when I feel like it."]},
+  },
+  dog: {
+    in:      {action:'bounding in',                              thoughts:["TOM HAS ARRIVED. TOM IS HAPPY.","Hi! Hi! Hi! Did you miss me? I was gone for eleven seconds."]},
+    cross:   {action:'passing through the office',               thoughts:["Just passing through, don't mind me.","Places to sniff, people to see."]},
+    sniff:   {action:'investigating a smell of great importance', thoughts:["Someone walked here. A hero, probably.","This spot smells 10% suspicious."]},
+    zoomies: {action:'having a main character moment',           thoughts:["CANNOT STOP. MUST ZOOM.","This is my final form."]},
+    beg:     {action:'workshopping a sad face',                  thoughts:["I have not eaten in several minutes.","Notice me. Feed me. Love me."]},
+    fetch:   {action:'"fetching" (mostly just holding a ball)',  thoughts:["I got it. I am keeping it. That was the plan all along.","Throw it again so I can not bring it back."]},
+    lean:    {action:'leaning on someone for emotional support',  thoughts:["I am a very small dog on the inside.","Structural support: my full-time job."]},
+    follow:  {action:'shadowing a human',                        thoughts:["Where you go, I also go. This is not negotiable.","Personal security detail, unpaid."]},
+    alert:   {action:'defending the office from a plane',        thoughts:["NOT TODAY, SKY INTRUDER.","I saved everyone. You're welcome."]},
+    meetcat: {action:"negotiating terms with "+PET_NAMES.cat,    thoughts:["We are in delicate diplomatic talks.","She started it. She always starts it."]},
+    bedwalk: {action:'heading to bed',                           thoughts:["Long day of very important sniffing.","Bedtime is my favorite meeting."]},
+    circle:  {action:'circling before lying down',               thoughts:["Just a few more laps, it has to be perfect.","Ancient ritual. Do not question it."]},
+    sleep:   {action:'passed out',                               thoughts:["Zzz... squirrel... zzz...","Recharging for more zoomies."]},
+    out:     {action:'heading out',                              thoughts:["Farewell! I will return with great enthusiasm.","Off to patrol the parking lot."]},
+  },
+};
+// resolve the right PET_MOOD entry for whatever the pet is actually doing right now
+function petMood(kind, p){
+  const table = PET_MOOD[kind];
+  let key;
+  if(kind==='dog' && p.mode==='cross') key='cross';
+  else if(p.state==='sleep')   key='sleep';
+  else if(p.state==='napwalk') key='napwalk';
+  else if(p.state==='bedwalk') key='bedwalk';
+  else if(p.state==='circle')  key='circle';
+  else if(p.state==='out')     key='out';
+  else if(p.state==='active')  key = kind==='cat' ? ('active_'+(p.behavior||'roam')) : (p.behavior||'sniff');
+  return table[key] || table.in;
+}
+// pick a "thought" line that stays stable for a few seconds (re-hovering shouldn't
+// flicker between lines every mousemove tick, but it should still change over time)
+function pickPetThought(kind, list){
+  const bucket = Math.floor(performance.now()/8000);
+  return list[hash(kind+':'+bucket) % list.length];
+}
+// a lightweight, persisted "history" of what's actually been done with each pet via the
+// command ring -- real counts, not fake flavor text, shown alongside the funny bits.
+let petStats = (()=>{ try{ return JSON.parse(localStorage.getItem('office_pet_stats')||'null'); }catch(e){ return null; } })() || {cat:{}, dog:{}};
+function bumpPetStat(kind, action){
+  petStats[kind][action] = (petStats[kind][action]||0)+1;
+  localStorage.setItem('office_pet_stats', JSON.stringify(petStats));
+}
+const PET_STAT_ICONS = {pet:'🐾', feed:'🍖', sit:'🪑', rollover:'🔄', desk:'💻', mouse:'🐭', pot:'🏺'};
+function petHistoryLine(kind){
+  const s = petStats[kind]||{};
+  const parts = Object.keys(PET_STAT_ICONS).filter(a=>s[a]).map(a=>PET_STAT_ICONS[a]+'×'+s[a]);
+  return parts.length ? parts.join('  ') : 'no history yet -- try the command ring';
+}
 const CAT_FUR = '#d9a441';                                 // Bengal base coat (warm gold/tan)
 const CAT_SPOTS=[[490,556],[300,478],[200,556],[410,556]]; // established safe nap/roam floor spots, clear of furniture
 const CAT_BEHAVIOR_WEIGHTS = {roam:3, eat:1, drink:1, poop:0.6, chase:2, lap:1.4, perch:1.4, rub:1.6};
@@ -6780,6 +6853,7 @@ function runPetCommand(kind, action){
   if(!isCat) p.mode = 'visit';                 // commands need the richer visit FSM, not the simple cross-and-leave one
   const name = PET_NAMES[kind];
   const spots = catStationSpots();
+  bumpPetStat(kind, action);                   // real per-pet command history, shown on hover
   switch(action){
     case 'pet':
       isCat ? petCat() : petDog();
@@ -6903,10 +6977,23 @@ function dispenseDrink(s){
 cv.addEventListener('mousemove', e=>{
   const m=toCanvas(e);
   if(bookshelfShown && !inHit(bookshelfHit,m.x,m.y)) bookshelfShown=false;   // left the shelf -> rebuild next time
-  // a pettable pet under the cursor?
+  // a pettable pet under the cursor? -- same rich tooltip shape as a human worker's
+  // (name+badge, meta, labelled sections, hint), just narrating a cat/dog instead of an agent.
   const pet=pickPet(m.x,m.y);
   if(pet){ hover=null; cv.style.cursor='pointer';
-    nametag.innerHTML='<div class="nt-hint">click '+PET_NAMES[pet]+' for actions</div>';
+    const pp = pet==='cat' ? amb.cat : amb.dog;
+    const mood = petMood(pet, pp);
+    const thought = pickPetThought(pet, mood.thoughts);
+    const napping = pp.state==='sleep';
+    const species = pet==='cat' ? 'Bengal cat' : ((pp.breed||'')+' dog').trim();
+    nametag.innerHTML =
+      '<div class="nt-name">'+esc(PET_NAMES[pet])+
+        '<span class="nt-badge '+(napping?'waiting':'working')+'">'+(napping?'napping':'active')+'</span></div>'+
+      '<div class="nt-meta">'+esc(species)+'  ·  '+esc(petHistoryLine(pet))+'</div>'+
+      '<div class="nt-label">Currently</div><div class="nt-text">'+esc(mood.action)+'</div>'+
+      '<div class="nt-label">Thinking</div><div class="nt-text">“'+esc(thought)+'”</div>'+
+      '<div class="nt-label">Backstory</div><div class="nt-text">'+esc(PET_BIO[pet])+'</div>'+
+      '<div class="nt-hint">click for actions</div>';
     nametag.style.display='block'; placeNametag(m); return; }
   // a vending-machine drink? (click drops it into the tray)
   const vs=pickVend(m.x,m.y);
