@@ -98,12 +98,14 @@ COVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "covers")
 #     sent to the kitchen, so a half-finished turn can't sit at a desk forever.
 SUBAGENT_ACTIVE_SECONDS = 120    # multitask subagent freshness window; --active-secs
 # Backstop only: a turn still "in progress" but completely silent this long is
-# treated as abandoned/crashed -> kitchen. Kept FAR out (2h) on purpose: the
-# transcript .jsonl records only user/assistant messages, NOT tool calls, so a
-# busy tool-heavy turn can legitimately write nothing for many minutes. A short
-# cap (e.g. 15m) wrongly evicted those active turns to the kitchen, so turn state
-# -- not mtime -- is the primary signal and this only catches genuinely dead ones.
-WORKING_STALE_CAP_SECONDS = 7200
+# treated as abandoned/crashed -> kitchen. There is NO real liveness check anywhere in
+# this file (no PID, no lock file) -- this cap IS the only thing that ever reclaims a
+# session that died mid-tool-call (closed terminal, killed process, sleep, dropped
+# connection), which is how most sessions actually die. Originally 2h ("busy tool-heavy
+# turns can legitimately write nothing for many minutes"), but in practice that left
+# dead sessions parked at a desk for up to two hours -- tightened to 30m, which still
+# gives a real long-running tool call (a big build/test run) plenty of headroom.
+WORKING_STALE_CAP_SECONDS = 1800
 # A turn that owes the user a PLAIN reply (last event is a real user message, no tool pending)
 # but has produced nothing for this long is stuck/abandoned -- e.g. an interrupted request the
 # user never continued. A real agent starts replying within seconds, so this is safe to keep
