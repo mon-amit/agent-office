@@ -6759,6 +6759,13 @@ function nearestPotSpot(x,y){
   for(const s of spots){ const d=Math.hypot(x-s[0], y-s[1]); if(d<bd){bd=d; best=s;} }
   return best;
 }
+// how long (ms) p will take to actually WALK to its just-set tx/ty at its current spd --
+// call this only after tx/ty/spd are all set. A command's bUntil must budget for this travel
+// time on top of whatever it wants to hold the pose for, or the automatic FSM's own timer
+// (pickCatBehavior/pickDogBehavior) fires and yanks the pet into a new random behavior
+// mid-stride -- exactly the "abrupt veer-off, didn't actually get there" bug a fixed
+// guessed duration caused for long walks (e.g. commanding a snack from across the room).
+function travelMs(p){ return Math.hypot(p.tx-p.x, p.ty-p.y)/p.spd*1000; }
 // run one command on whichever pet was clicked -- mostly by driving the SAME behavior
 // fields the automatic FSM already uses (tx/ty/behavior/bUntil/pose), so a command just
 // looks like "one behavior, chosen by the user instead of at random" and the automatic
@@ -6779,8 +6786,8 @@ function runPetCommand(kind, action){
       return;
     case 'feed': {
       p.state='active'; p.walking=true; p.spd=95; p.bStart=now;
-      if(isCat){ p.behavior='eat'; p.tx=spots.food[0]; p.ty=spots.food[1]; p.bUntil=now+CAT_BEHAVIOR_DUR.eat; }
-      else { p.behavior=null; p.pose='walk'; p.onArrivePose='sit'; p.tx=DOG_BOWL_X-4; p.ty=layout().kitchenTop+DOG_BOWL_Y_OFFSET; p.bUntil=now+4500; }
+      if(isCat){ p.behavior='eat'; p.tx=spots.food[0]; p.ty=spots.food[1]; p.bUntil=now+travelMs(p)+CAT_BEHAVIOR_DUR.eat; }
+      else { p.behavior=null; p.pose='walk'; p.onArrivePose='sit'; p.tx=DOG_BOWL_X-4; p.ty=layout().kitchenTop+DOG_BOWL_Y_OFFSET; p.bUntil=now+travelMs(p)+3000; }
       toast('🍖 '+name+' goes to eat!');
       break;
     }
@@ -6799,15 +6806,16 @@ function runPetCommand(kind, action){
     case 'desk': {
       const seated = people.filter(x=>x.kind==='work' && x.seated);
       p.state='active'; p.walking=true; p.spd=115; p.bStart=now;
+      let holdMs;
       if(isCat){
-        if(seated.length){ const s=seated[(Math.random()*seated.length)|0]; p.behavior='lap'; p.behaviorPersonId=s.id; p.tx=s.deskX; p.ty=s.deskY+8; p.bUntil=now+CAT_BEHAVIOR_DUR.lap; }
-        else { const s=spots.perches[(Math.random()*spots.perches.length)|0]; p.behavior='perch'; p.tx=s[0]; p.ty=s[1]; p.bUntil=now+CAT_BEHAVIOR_DUR.perch; }
+        if(seated.length){ const s=seated[(Math.random()*seated.length)|0]; p.behavior='lap'; p.behaviorPersonId=s.id; p.tx=s.deskX; p.ty=s.deskY+8; holdMs=CAT_BEHAVIOR_DUR.lap; }
+        else { const s=spots.perches[(Math.random()*spots.perches.length)|0]; p.behavior='perch'; p.tx=s[0]; p.ty=s[1]; holdMs=CAT_BEHAVIOR_DUR.perch; }
       } else {
-        p.behavior=null; p.pose='walk'; p.onArrivePose='sit';
+        p.behavior=null; p.pose='walk'; p.onArrivePose='sit'; holdMs=4000;
         if(seated.length){ const s=seated[(Math.random()*seated.length)|0]; p.tx=s.deskX+18; p.ty=s.deskY+14; }
         else { p.tx=p.x; p.ty=p.y; }
-        p.bUntil=now+5500;
       }
+      p.bUntil = now + travelMs(p) + holdMs;
       toast(name+' heads to a desk.');
       break;
     }
@@ -6828,13 +6836,15 @@ function runPetCommand(kind, action){
     }
     case 'pot': {
       const best = nearestPotSpot(p.x, p.y);
-      p.state='active'; p.walking=true; p.spd=130; p.bStart=now; p.bUntil=now+1800; p.behavior=null;
+      p.state='active'; p.walking=true; p.spd=130; p.bStart=now; p.behavior=null;
       p.tx=best[0]; p.ty=best[1]-6;
       if(!isCat) p.pose='walk';
-      setTimeout(()=>{
+      const travel = travelMs(p);          // the shatter effect must wait for the ACTUAL walk there,
+      p.bUntil = now + travel + 700;        // not a flat guess -- otherwise it can fire mid-stride,
+      setTimeout(()=>{                      // nowhere near the pot, if the pet started far away.
         potBreak = {x:best[0], y:best[1], start:performance.now(), until:performance.now()+1600};
         toast('🏺 '+name+' knocked over a pot!');
-      }, 950);
+      }, travel + 80);
       break;
     }
   }
