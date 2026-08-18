@@ -2117,6 +2117,18 @@ PAGE = r"""<!DOCTYPE html>
   #legend span{display:inline-flex;align-items:center;gap:6px;}
   #legend i{width:10px;height:10px;border-radius:2px;display:inline-block;}
 
+  /* pet command menu: a small ring of action buttons around a clicked cat/dog */
+  #petmenu{position:absolute;display:none;z-index:21;pointer-events:none;}
+  #petmenu .pm-btn{position:absolute;width:32px;height:32px;margin:-16px 0 0 -16px;
+    display:flex;align-items:center;justify-content:center;font-size:15px;
+    background:var(--panel);border:2px solid rgba(255,255,255,.25);border-radius:50%;
+    cursor:pointer;pointer-events:auto;color:var(--ink-hi);
+    box-shadow:0 2px 8px rgba(0,0,0,.4);transition:transform .08s,border-color .08s;}
+  #petmenu .pm-btn:hover{transform:scale(1.2);border-color:#7dd3fc;}
+  #petmenu .pm-label{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    font-size:9px;color:#fff;background:rgba(20,22,30,.88);padding:4px 8px;border-radius:10px;
+    white-space:nowrap;pointer-events:none;border:1px solid rgba(255,255,255,.18);}
+
   /* overlay dialog */
   #overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
     background:rgba(15,24,8,.55);padding:14px;z-index:20;}
@@ -2234,6 +2246,7 @@ PAGE = r"""<!DOCTYPE html>
         <button id="call-cat" class="zonebtn" aria-label="call Yumeko" data-tip="call Yumeko">&#128049;</button>
         <button id="call-dog" class="zonebtn" aria-label="call Tom" data-tip="call Tom">&#128054;</button>
         <div id="nametag"></div>
+        <div id="petmenu"></div>
         <div id="empty">No agents active in the last <b id="emh">24</b>h.<br/><br/>
           Start a chat in Cursor or Claude Code, or run with <b>--demo</b> to populate the office.</div>
         <div id="overlay">
@@ -2885,6 +2898,7 @@ function drawFloor(){
   drawOfficeProps();
   drawKitchenProps();
   drawPetBowls();
+  drawPotBreak();
 }
 
 // ---- cat + dog feeding stations (drawn as real static props, not just target coords) ----
@@ -2951,6 +2965,30 @@ function bigPlant(x,y){
   // a fan of fern/snake-plant blades of varied height
   [[-9,22,-12],[-6,32,-8],[-3,42,-4],[0,48,0],[3,42,4],[6,32,8],[9,24,12]]
     .forEach((d,i)=> blade(cx+d[0], y+5, d[1], d[2], (i===3)?PAL.leaf:(i%2?PAL.leaf:PAL.leafDk)));
+}
+// the three potted-plant spots a pet can be sent to "break a pot" at (matches the
+// exact coordinates drawOfficeProps plants its bigPlant()s at -- see there).
+let potBreak = null;   // {x,y,start,until} -- a brief knocked-over-pot shatter effect
+function potSpots(){
+  const lastDeskY = deskSlots.length ? Math.max.apply(null, deskSlots.map(s=>s.y)) : WALL_H+120;
+  return [ [23, WALL_H+30], [W-21, WALL_H+30], [43, lastDeskY+64] ];
+}
+// terracotta shards + a settling soil puff, right where a pet just knocked a pot over
+function drawPotBreak(){
+  if(!potBreak) return;
+  const now=performance.now();
+  if(now>=potBreak.until){ potBreak=null; return; }
+  const p=(now-potBreak.start)/(potBreak.until-potBreak.start);
+  const {x,y}=potBreak;
+  ctx.fillStyle='rgba(0,0,0,.12)'; ctx.beginPath(); ctx.ellipse(x,y+3,14,4,0,0,Math.PI*2); ctx.fill();
+  const shards=[[-10,-6],[8,-8],[-4,4],[6,3],[-12,2],[11,-2]];
+  for(let i=0;i<shards.length;i++){
+    const [dx,dy]=shards[i], reach=Math.min(1,p*1.7);
+    const ex=x+dx*reach, ey=y+dy*reach-Math.sin(Math.min(1,p*1.4)*Math.PI)*6;
+    px(Math.round(ex)-1, Math.round(ey)-1, 2, 2, i%2 ? PAL.pot : shade(PAL.pot,-.2));
+  }
+  ctx.fillStyle='rgba(120,90,60,'+(0.5*(1-p)).toFixed(2)+')';
+  ctx.beginPath(); ctx.ellipse(x, y+4, 10*p, 3*p, 0, 0, Math.PI*2); ctx.fill();
 }
 // a little potted orange tree -- click a ripe orange to pick it (see ORANGE_SPOTS / treeHit)
 function drawOrangeTree(x,y){
@@ -5909,6 +5947,7 @@ function updateDogBehavior(d, now, sec){
     if(dist<=d.spd*sec+1 && d.behavior!=='sniff' && d.behavior!=='zoomies'){
       d.x=d.tx; d.y=d.ty; d.walking=false;
       if(d.behavior==='zoomies'){ d.pose='bow'; }                        // slam to a stop in a play bow
+      if(d.onArrivePose){ d.pose=d.onArrivePose; d.onArrivePose=null; }   // a command (e.g. "feed") wants a hold-pose on arrival
     } else if(dist>0.5){
       const step=Math.min(dist, d.spd*sec);
       d.x+=dx/dist*step; d.y+=dy/dist*step;
@@ -6297,11 +6336,36 @@ function drawDogOverlay(d, t, pal){
   }
 }
 
+// a shared "roll over!" trick animation for either pet (see runPetCommand) -- a playful
+// wobbly spin-in-place with a couple of stub paws and a little sparkle, independent of
+// whatever pose/behavior it was doing a moment before the command. Returns true if it
+// drew (and the caller should skip its normal rendering for this frame).
+function drawTrick(p, bodyColor){
+  const trick=p.trick;
+  if(!trick) return false;
+  const now=performance.now();
+  if(now>=trick.until){ p.trick=null; return false; }
+  const rp=(now-trick.start)/(trick.until-trick.start);
+  const x=p.x, y=p.y-8;
+  ctx.save();
+  ctx.translate(x,y); ctx.rotate(Math.sin(rp*Math.PI*3)*1.1); ctx.translate(-x,-y);
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x,y+9,15,4,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=bodyColor; ctx.beginPath(); ctx.ellipse(x,y,13,9,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=shade(bodyColor,.3); ctx.beginPath(); ctx.ellipse(x-3,y-3,6,4,0,0,Math.PI*2); ctx.fill();
+  px(x-6,y-2,3,3,shade(bodyColor,-.3)); px(x+3,y-2,3,3,shade(bodyColor,-.3));   // stub paws waving in the air
+  const spark=1-Math.abs(rp-0.5)*2;
+  ctx.fillStyle='rgba(255,240,150,'+(0.9*spark).toFixed(2)+')'; ctx.font='7px "Press Start 2P", monospace';
+  ctx.fillText('*', x+12, y-14); ctx.fillText('*', x-16, y-4);
+  ctx.restore();
+  return true;
+}
+
 function drawDog(d, t){
   ctx.save();
   scaleAbout(d.x, d.y, SC);
   if(d.dir<0){ ctx.translate(d.x,0); ctx.scale(-1,1); ctx.translate(-d.x,0); }  // face left
   const pal = dogPalette(d.breed);
+  if(drawTrick(d, pal.c)){ ctx.restore(); return; }
   // sit/flop/rear/bow are structurally different silhouettes (not walking), so they get
   // their own small generic-by-palette functions rather than shoehorning a crouch/sit
   // into the walking per-breed geometry below.
@@ -6529,6 +6593,7 @@ function drawCroc(c, t){
 function drawCat(c, t){
   ctx.save();
   scaleAbout(c.x, c.y, SC);
+  if(drawTrick(c, c.fur)){ ctx.restore(); return; }
   const fur=c.fur, furDk=shade(fur,-.40), furHi=shade(fur,.30), pink='#e79ab0', nose='#cf7a8e', cream='#f3e6c8';
   const el=(cx,cy,rx,ry,col)=>{ ctx.fillStyle=col; ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.fill(); };
   const x=c.x, y=c.y;
@@ -6688,6 +6753,93 @@ function petCat(){ const c=amb.cat; if(!c || c.encounter) return; initAudio();  
   }
 }
 
+// ---- pet command menu: click a pet -> a ring of actions (see openPetMenu) ----
+function nearestPotSpot(x,y){
+  const spots=potSpots(); let best=spots[0], bd=1e9;
+  for(const s of spots){ const d=Math.hypot(x-s[0], y-s[1]); if(d<bd){bd=d; best=s;} }
+  return best;
+}
+// run one command on whichever pet was clicked -- mostly by driving the SAME behavior
+// fields the automatic FSM already uses (tx/ty/behavior/bUntil/pose), so a command just
+// looks like "one behavior, chosen by the user instead of at random" and the automatic
+// FSM picks back up cleanly on its own once bUntil elapses.
+function runPetCommand(kind, action){
+  const now = performance.now();
+  const isCat = kind==='cat';
+  if(isCat && !amb.cat) startCat(now);
+  if(!isCat && !amb.dog) startDog(now);
+  const p = isCat ? amb.cat : amb.dog;
+  if(!p) return;
+  if(!isCat) p.mode = 'visit';                 // commands need the richer visit FSM, not the simple cross-and-leave one
+  const name = PET_NAMES[kind];
+  const spots = catStationSpots();
+  switch(action){
+    case 'pet':
+      isCat ? petCat() : petDog();
+      return;
+    case 'feed': {
+      p.state='active'; p.walking=true; p.spd=95; p.bStart=now;
+      if(isCat){ p.behavior='eat'; p.tx=spots.food[0]; p.ty=spots.food[1]; p.bUntil=now+CAT_BEHAVIOR_DUR.eat; }
+      else { p.behavior=null; p.pose='walk'; p.onArrivePose='sit'; p.tx=DOG_BOWL_X-4; p.ty=layout().kitchenTop+DOG_BOWL_Y_OFFSET; p.bUntil=now+4500; }
+      toast('🍖 '+name+' goes to eat!');
+      break;
+    }
+    case 'sit': {
+      p.state='active'; p.walking=false; p.bStart=now; p.bUntil=now+6000;
+      if(isCat){ p.behavior='perch'; p.tx=p.x; p.ty=p.y; }
+      else { p.behavior=null; p.pose='sit'; }
+      toast(name+' sits.');
+      break;
+    }
+    case 'rollover': {
+      p.trick = {start:now, until:now+2200};
+      toast(name+' rolls over!');
+      break;
+    }
+    case 'desk': {
+      const seated = people.filter(x=>x.kind==='work' && x.seated);
+      p.state='active'; p.walking=true; p.spd=115; p.bStart=now;
+      if(isCat){
+        if(seated.length){ const s=seated[(Math.random()*seated.length)|0]; p.behavior='lap'; p.behaviorPersonId=s.id; p.tx=s.deskX; p.ty=s.deskY+8; p.bUntil=now+CAT_BEHAVIOR_DUR.lap; }
+        else { const s=spots.perches[(Math.random()*spots.perches.length)|0]; p.behavior='perch'; p.tx=s[0]; p.ty=s[1]; p.bUntil=now+CAT_BEHAVIOR_DUR.perch; }
+      } else {
+        p.behavior=null; p.pose='walk'; p.onArrivePose='sit';
+        if(seated.length){ const s=seated[(Math.random()*seated.length)|0]; p.tx=s.deskX+18; p.ty=s.deskY+14; }
+        else { p.tx=p.x; p.ty=p.y; }
+        p.bUntil=now+5500;
+      }
+      toast(name+' heads to a desk.');
+      break;
+    }
+    case 'mouse': {
+      if(isCat){
+        const rx=60+Math.random()*430, ry=460+Math.random()*90;
+        p.state='active'; p.walking=true; p.spd=175; p.bStart=now; p.bUntil=now+5500; p.behavior='chase';
+        p.toy={x:rx, y:ry, vx:(Math.random()<0.5?-1:1)*(35+Math.random()*45), vy:(Math.random()<0.5?-1:1)*(20+Math.random()*30)};
+        p.tx=p.toy.x; p.ty=p.toy.y;
+      } else {
+        const s=CAT_SPOTS[(Math.random()*CAT_SPOTS.length)|0];
+        p.state='active'; p.walking=true; p.spd=225; p.bStart=now; p.bUntil=now+3400; p.behavior='zoomies'; p.pose='walk';
+        p.tx=s[0]; p.ty=s[1];
+      }
+      toast('🐭 '+name+' spots a mouse!');
+      setTimeout(()=>{ if((isCat?amb.cat:amb.dog)===p) toast('🐭 '+name+' caught it!'); }, 2400);
+      break;
+    }
+    case 'pot': {
+      const best = nearestPotSpot(p.x, p.y);
+      p.state='active'; p.walking=true; p.spd=130; p.bStart=now; p.bUntil=now+1800; p.behavior=null;
+      p.tx=best[0]; p.ty=best[1]-6;
+      if(!isCat) p.pose='walk';
+      setTimeout(()=>{
+        potBreak = {x:best[0], y:best[1], start:performance.now(), until:performance.now()+1600};
+        toast('🏺 '+name+' knocked over a pot!');
+      }, 950);
+      break;
+    }
+  }
+}
+
 // ---- interaction ----
 function toCanvas(ev){
   const r=cv.getBoundingClientRect();
@@ -6744,7 +6896,7 @@ cv.addEventListener('mousemove', e=>{
   // a pettable pet under the cursor?
   const pet=pickPet(m.x,m.y);
   if(pet){ hover=null; cv.style.cursor='pointer';
-    nametag.innerHTML='<div class="nt-hint">click to pet '+PET_NAMES[pet]+'</div>';
+    nametag.innerHTML='<div class="nt-hint">click '+PET_NAMES[pet]+' for actions</div>';
     nametag.style.display='block'; placeNametag(m); return; }
   // a vending-machine drink? (click drops it into the tray)
   const vs=pickVend(m.x,m.y);
@@ -6893,13 +7045,53 @@ cv.addEventListener('click', e=>{
     if(!picked) toast('no ripe oranges right now -- they regrow soon');
     return;
   }
-  const pet=pickPet(m.x,m.y);                 // pet the dog/cat before opening any worker
-  if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
+  const pet=pickPet(m.x,m.y);                 // pop the command ring before opening any worker
+  if(pet){ openPetMenu(pet, m.cx, m.cy); return; }
   const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray
   if(slot){ dispenseDrink(slot); return; }
   const p=pick(m.x,m.y);
   if(p) openDetail(p.agent.id);
 });
+
+// ---- the pet command ring: pet / feed / sit / roll over / desk / catch mouse / break a pot --
+const PET_ACTIONS = [
+  {a:'pet',      icon:'🐾', label:'Pet'},
+  {a:'feed',     icon:'🍖', label:'Feed'},
+  {a:'sit',      icon:'🪑', label:'Sit'},
+  {a:'rollover', icon:'🔄', label:'Roll over'},
+  {a:'desk',     icon:'💻', label:'Go to desk'},
+  {a:'mouse',    icon:'🐭', label:'Catch mouse'},
+  {a:'pot',      icon:'🏺', label:'Break a pot'},
+];
+const petmenuEl = document.getElementById('petmenu');
+let petMenuKind = null;
+function openPetMenu(kind, cx, cy){
+  petMenuKind = kind;
+  const n = PET_ACTIONS.length, R = 54;
+  let html = '<div class="pm-label">'+esc(PET_NAMES[kind])+'</div>';
+  PET_ACTIONS.forEach((act,i)=>{
+    const ang = -Math.PI/2 + i*(Math.PI*2/n);
+    const bx = Math.round(Math.cos(ang)*R), by = Math.round(Math.sin(ang)*R);
+    html += '<button class="pm-btn" style="left:'+bx+'px;top:'+by+'px" data-action="'+act.a+'" aria-label="'+esc(act.label)+'" title="'+esc(act.label)+'">'+act.icon+'</button>';
+  });
+  petmenuEl.innerHTML = html;
+  const r = cv.getBoundingClientRect(), pad = R+22;
+  const left = Math.max(pad, Math.min(r.width-pad, cx));
+  const top  = Math.max(pad, Math.min(r.height-pad, cy));
+  petmenuEl.style.left = Math.round(left)+'px'; petmenuEl.style.top = Math.round(top)+'px';
+  petmenuEl.style.display = 'block';
+  nametag.style.display = 'none';
+}
+function closePetMenu(){ petMenuKind = null; petmenuEl.style.display='none'; petmenuEl.innerHTML=''; }
+petmenuEl.addEventListener('click', e=>{
+  const btn = e.target.closest('.pm-btn');
+  if(btn && petMenuKind) runPetCommand(petMenuKind, btn.dataset.action);
+  closePetMenu();
+});
+document.addEventListener('click', e=>{
+  if(petMenuKind && e.target!==cv && !petmenuEl.contains(e.target)) closePetMenu();
+});
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closePetMenu(); });
 
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 // compact token count for the hover card ("1.2M tokens" / "840k tokens")
