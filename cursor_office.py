@@ -2056,9 +2056,11 @@ PAGE = r"""<!DOCTYPE html>
   #screen #drown-beach[data-tip]::after{right:0;font-size:16px;padding:2px 8px;}  /* extend left; big devil */
   #screen #call-cat[data-tip]::after{left:0;}
   #screen #call-dog[data-tip]::after{left:0;}
+  #screen #call-croc[data-tip]::after{left:0;}
   #screen #sweep-kitchen{left:7px;}
   #screen #call-cat{left:37px;}
   #screen #call-dog{left:67px;}
+  #screen #call-croc{left:97px;}
   #screen #drown-beach{right:22px;}   /* floats on the ocean band in the beach's bottom-right corner */
   #brand #sound.off,#brand #filter.off{color:#8a8a90;}
   #brand #filter.on{background:#2f5fb0;border-color:#3f6fc0;color:#fff;}
@@ -2247,6 +2249,7 @@ PAGE = r"""<!DOCTYPE html>
         <button id="drown-beach" class="zonebtn" aria-label="beach" data-tip="&#128520;">&#127754;</button>
         <button id="call-cat" class="zonebtn" aria-label="call Yumeko" data-tip="call Yumeko">&#128049;</button>
         <button id="call-dog" class="zonebtn" aria-label="call Tom" data-tip="call Tom">&#128054;</button>
+        <button id="call-croc" class="zonebtn" aria-label="call Gil" data-tip="call Gil">&#128010;</button>
         <div id="nametag"></div>
         <div id="petmenu"></div>
         <div id="empty">No agents active in the last <b id="emh">24</b>h.<br/><br/>
@@ -6237,6 +6240,7 @@ function updateCatBehavior(c, now, sec){
 
 // ---- a tiny airliner drifts across the WINDOW sky, above the buildings, near the clouds ----
 // ---- the office crocodile: a pink crocodile in a heart-print dress, just passing through ----
+const CROC_NAME = 'Gil';
 function startCroc(now){
   const dir = Math.random()<0.5 ? 1 : -1;
   amb.croc = {
@@ -7574,6 +7578,12 @@ document.getElementById('call-dog').addEventListener('click', ()=>{
     startDog(performance.now());
     toast('Tom is coming! 🐶');
   }
+});
+// CALL GIL: the crocodile just strolls straight across and off (no lingering state to
+// re-target like the cat/dog), so "calling" him simply (re)starts a fresh crossing.
+document.getElementById('call-croc').addEventListener('click', ()=>{
+  startCroc(performance.now());
+  toast(CROC_NAME+' is coming! 🐊');
 });
 
 let toastT=null;
