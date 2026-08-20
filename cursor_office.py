@@ -6240,13 +6240,26 @@ function updateCatBehavior(c, now, sec){
 
 // ---- a tiny airliner drifts across the WINDOW sky, above the buildings, near the clouds ----
 // ---- the office crocodile: a pink crocodile in a heart-print dress, just passing through ----
+// (or, on a beach visit, walking on through the sand for a swim and a nap on the shore first)
 const CROC_NAME = 'Gil';
-function startCroc(now){
-  const dir = Math.random()<0.5 ? 1 : -1;
+// a clear patch of sand right along the shoreline (past the towels/umbrella/ball cluster
+// drawBeachProps plants further up-left of BEACH_X) -- where Gil climbs out to bask/nap.
+function crocSandSpot(){ return { x: SHORE_X - 20, y: H - 24 }; }
+// mid-ocean -- the SAME spot a drowned/resurfacing agent uses (see rebuild()'s SEA const),
+// so Gil's dive reads as visiting the same sea, not some other patch of water.
+function crocSeaSpot(){ const L=layout(); return { x: SHORE_X + Math.round(WATER_W*0.5), y: L.kitchenTop + Math.round((H-L.kitchenTop)*0.45) }; }
+function startCroc(now, opts){
+  opts = opts || {};
+  // a beach visit always enters from the left so the walk->sand->sea path makes geometric
+  // sense; a plain crossing (the original behavior) can still enter from either side.
+  const beach = opts.beach != null ? opts.beach : Math.random() < 0.55;
+  const dir = beach ? 1 : (Math.random()<0.5 ? 1 : -1);
   amb.croc = {
     dir, x: dir>0 ? -34 : W+34,
     y: layout().kitchenTop - 20,               // same front-office lane the dog crosses
     spd: 46 + Math.random()*14,
+    mode: beach ? 'beach' : 'cross',
+    phase: 'walk',                             // beach only: walk -> toshore -> dive -> swim -> toshore2 -> nap -> leave
   };
 }
 function startPlane(now){
@@ -6286,9 +6299,49 @@ function updateAmbient(now, dt){
   if(!nextEventAt) scheduleNextEvent(now);          // first event ~30-60s after load
   if(now>=nextEventAt){ fireRandomEvent(now); scheduleNextEvent(now); }
   const sec=dt/1000;
-  if(amb.croc){ const cr=amb.croc;                  // just strolls straight across and off
-    cr.x += cr.dir*cr.spd*sec;
-    if((cr.dir>0 && cr.x>W+40) || (cr.dir<0 && cr.x<-40)) amb.croc=null;
+  if(amb.croc){ const cr=amb.croc;
+    if(cr.mode!=='beach'){                          // plain crossing: strolls straight across and off
+      cr.x += cr.dir*cr.spd*sec;
+      if((cr.dir>0 && cr.x>W+40) || (cr.dir<0 && cr.x<-40)) amb.croc=null;
+    } else if(cr.phase==='walk'){
+      cr.x += cr.dir*cr.spd*sec;
+      if(cr.x >= BEACH_X-90){ const s=crocSandSpot(); cr.phase='toshore'; cr.tx=s.x; cr.ty=s.y; }
+    } else if(cr.phase==='toshore' || cr.phase==='toshore2'){
+      const dx=cr.tx-cr.x, dy=cr.ty-cr.y, d=Math.hypot(dx,dy);
+      if(d<=cr.spd*sec+1){
+        cr.x=cr.tx; cr.y=cr.ty;
+        if(cr.phase==='toshore'){                    // reached the shore -> belly-flop in
+          const w=crocSeaSpot(); cr.phase='dive'; cr.phaseStart=now; cr.phaseUntil=now+900; cr.tx=w.x; cr.ty=w.y;
+        } else {                                      // climbed back out -> bask/nap on the sand
+          cr.phase='nap'; cr.phaseUntil=now + 9000 + Math.random()*6000;
+        }
+      } else { if(Math.abs(dx)>2) cr.dir=dx>=0?1:-1; const step=Math.min(d,cr.spd*sec); cr.x+=dx/d*step; cr.y+=dy/d*step; }
+    } else if(cr.phase==='dive'){
+      const dx=cr.tx-cr.x, dy=cr.ty-cr.y, d=Math.hypot(dx,dy);
+      if(d>0.5){ const step=Math.min(d, cr.spd*1.4*sec); cr.x+=dx/d*step; cr.y+=dy/d*step; }
+      if(now>=cr.phaseUntil){
+        cr.phase='swim'; cr.phaseUntil=now + 5000 + Math.random()*3000;
+        cr.swimVX=(Math.random()<0.5?-1:1)*(18+Math.random()*14); cr.swimVY=(Math.random()<0.5?-1:1)*(8+Math.random()*8);
+      }
+    } else if(cr.phase==='swim'){
+      cr.x += (cr.swimVX||0)*sec; cr.y += (cr.swimVY||0)*sec;
+      const L=layout(), loX=SHORE_X+10, hiX=W-14, loY=L.kitchenTop+18, hiY=H-18;
+      if(cr.x<loX||cr.x>hiX) cr.swimVX*=-1;
+      if(cr.y<loY||cr.y>hiY) cr.swimVY*=-1;
+      cr.x=Math.max(loX,Math.min(hiX,cr.x)); cr.y=Math.max(loY,Math.min(hiY,cr.y));
+      if(cr.swimVX) cr.dir = cr.swimVX>=0 ? 1 : -1;
+      if(now>=cr.phaseUntil){ const s=crocSandSpot(); cr.phase='toshore2'; cr.tx=s.x; cr.ty=s.y; }
+    } else if(cr.phase==='nap'){
+      if(now>=cr.phaseUntil){ const w=crocSeaSpot(); cr.phase='leave'; cr.dir=1; cr.tx=w.x; cr.ty=w.y; }
+    } else if(cr.phase==='leave'){                   // swims back out to sea, then off the right edge
+      if(cr.tx < W){                                  // still chasing the sea spot -- once reached,
+        const d0=Math.hypot(cr.tx-cr.x, cr.ty-cr.y);   // retarget off-screen ONCE so he keeps swimming
+        if(d0 <= cr.spd*1.2*sec+2) cr.tx = W+80;       // right instead of endlessly snapping back to it
+      }
+      const dx=cr.tx-cr.x, dy=cr.ty-cr.y, d=Math.hypot(dx,dy);
+      if(d>0.5){ const step=Math.min(d, cr.spd*1.2*sec); cr.x+=dx/d*step; cr.y+=dy/d*step; }
+      if(cr.x>W+40) amb.croc=null;
+    }
   }
   if(amb.dog){ const d=amb.dog;
     if(d.mode==='cross'){
@@ -6640,12 +6693,65 @@ function drawBengalFace(el, px, hx, hy, dir, furDk, cream){
   px(hx-1, hy-6, 1, 2, furDk); px(hx+2, hy-6, 1, 2, furDk);   // faint forehead "M" mark
 }
 
+// a ripple ring (dive splash / swimming wake) -- shared by the dive and swim poses
+function crocRipple(x, y, r, alpha){
+  ctx.strokeStyle='rgba(255,255,255,'+alpha.toFixed(2)+')'; ctx.lineWidth=1.4;
+  ctx.beginPath(); ctx.ellipse(x, y, r, r*0.4, 0, 0, Math.PI*2); ctx.stroke();
+}
 function drawCroc(c, t){
   ctx.save();
   scaleAbout(c.x, c.y, SC);
   const x=c.x, y=c.y;
   const body='#f2a8c4', bodyDk=shade(body,-.28), bodyHi=shade(body,.22), belly='#fbd7e4';
   const bob=Math.sin(t*0.35)*1;
+  const now=performance.now();
+
+  if(c.mode==='beach' && c.phase==='dive'){
+    // a quick belly-flop splash: he fades into the water while a ripple ring grows outward
+    const p = Math.max(0, Math.min(1, (now-(c.phaseStart||now))/((c.phaseUntil||now+1)-(c.phaseStart||now))));
+    ctx.globalAlpha = 1-p*0.75;
+    crocRipple(x, y+2, 6+p*20, 0.7*(1-p));
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    return;
+  }
+  if(c.mode==='beach' && c.phase==='swim'){
+    // mostly-submerged: same silhouette (no legs -- they're tucked, paddling underwater),
+    // dimmed toward the water's tint, with a little wake rippling off behind him
+    ctx.save();
+    if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }
+    ctx.globalAlpha = 0.62;
+    px(x-22,y-6+bob,10,4,body);                                     // tail, mostly at the surface
+    ro(x-12,y-8+bob,26,6,body); px(x-12,y-8+bob,26,2,bodyHi);        // body riding low in the water
+    const hx=x+12, hy=y-10+bob;
+    ro(hx, hy, 16, 5, body);
+    px(hx, hy-2, 2, 2, PAL.outline); px(hx+4, hy-2, 2, 2, PAL.outline);  // eyes still poke up, periscope-style
+    ctx.restore();
+    ctx.globalAlpha = 1;
+    const wakeF=((t*2)%3+3)%3;
+    crocRipple(x-(c.dir||1)*16, y+2, 4+wakeF*4, 0.5*(1-wakeF/3));
+    ctx.restore();
+    return;
+  }
+  if(c.mode==='beach' && c.phase==='nap'){
+    // curled up asleep on the sand -- closed eyes, tucked legs, tail wrapped in, rising Zzz's
+    ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x, y+2, 22, 4, 0, 0, Math.PI*2); ctx.fill();
+    px(x-20,y-7,9,4,body); px(x-20,y-7,9,1,bodyHi);                  // tail curled alongside
+    ro(x-12,y-9,24,6,body); px(x-12,y-9,24,2,bodyHi);                // low resting body
+    px(x-10,y-5,18,2,belly);
+    const hx=x+9, hy=y-11;
+    ro(hx, hy, 14, 5, body);
+    px(hx, hy-1, 3, 1, PAL.outline); px(hx+4, hy-1, 3, 1, PAL.outline);  // closed eyes (flat lines)
+    ro(x-11, y-8, 20, 5, '#e6547d');                                  // dress, resting
+    pixHeart(x-5, y-7, '#ffffff'); pixHeart(x+2, y-7, '#ffffff');
+    const f=t*0.5;
+    ctx.fillStyle=PAL.ink; ctx.font='6px "Press Start 2P", monospace';
+    ctx.fillText('z', x+3-((f)%10), y-18-((f)%10));
+    ctx.font='5px "Press Start 2P", monospace'; ctx.fillText('z', x+8-((f+5)%12), y-14-((f+5)%12));
+    ctx.restore();
+    return;
+  }
+
   ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x, y+2, 24, 4, 0, 0, Math.PI*2); ctx.fill();
   ctx.save();
   if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }  // face walk dir
@@ -7579,11 +7685,12 @@ document.getElementById('call-dog').addEventListener('click', ()=>{
     toast('Tom is coming! 🐶');
   }
 });
-// CALL GIL: the crocodile just strolls straight across and off (no lingering state to
-// re-target like the cat/dog), so "calling" him simply (re)starts a fresh crossing.
+// CALL GIL: no lingering state to re-target like the cat/dog (he just walks through), so
+// "calling" him (re)starts a fresh visit -- always the full beach trip (walk in, dive,
+// swim, nap on the sand, swim off) rather than the plain 45%-chance ambient crossing.
 document.getElementById('call-croc').addEventListener('click', ()=>{
-  startCroc(performance.now());
-  toast(CROC_NAME+' is coming! 🐊');
+  startCroc(performance.now(), {beach:true});
+  toast(CROC_NAME+' is off to the beach! 🐊🏖️');
 });
 
 let toastT=null;
