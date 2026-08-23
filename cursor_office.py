@@ -72,6 +72,11 @@ CURSOR_PROJECTS_DIR = os.path.expanduser("~/.cursor/projects")
 # shape as Cursor, so both sources feed the SAME office (each worker is tagged with
 # its `source` so the UI can tell a Cursor agent from a Claude Code agent).
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+# Claude Code (desktop/CLI) writes one ~/.claude/sessions/<pid>.json per live process,
+# {"pid":..., "sessionId":...}. This is a REAL liveness signal -- unlike everything else
+# status is inferred from (turn state + transcript silence), this tells us for a FACT
+# whether the actual process behind a session has exited. See _session_pid_map()/_is_working.
+CLAUDE_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
 # Third-party bridges (e.g. notion_agent_sync.py) write Claude-Code-shaped .jsonl
 # transcripts here so non-Cursor/non-Claude agent activity can show up in the same
 # office, tagged with its own `source` ("notion") rather than masquerading as Claude.
@@ -555,7 +560,47 @@ def _open_shells_claude(path, cap=6):
     return out
 
 
-def _is_working(turn_in_progress, eff_mtime, sub_files, wf_latest=0.0):
+def _pid_alive(pid):
+    """True/False if we could determine it, None if we couldn't tell (don't guess)."""
+    if not pid:
+        return None
+    try:
+        os.kill(pid, 0)          # signal 0: existence check only, doesn't actually signal anything
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True              # exists, just owned by someone/something else -- still alive
+    except OSError:
+        return None
+    return True
+
+
+def _session_pid_map():
+    """{sessionId: [pid, ...]} from every ~/.claude/sessions/<pid>.json -- one file per
+    live-or-recently-live Claude Code process. Lets _is_working check whether the actual
+    PROCESS behind a session has exited, instead of only ever inferring liveness from
+    transcript silence. Built once per request (the directory is tiny); a session can have
+    more than one pid on record if it was resumed, so callers should check ALL of them."""
+    out = {}
+    try:
+        names = os.listdir(CLAUDE_SESSIONS_DIR)
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(CLAUDE_SESSIONS_DIR, name), "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+            sid, pid = d.get("sessionId"), d.get("pid")
+            if sid and pid:
+                out.setdefault(sid, []).append(pid)
+        except Exception:
+            continue
+    return out
+
+
+def _is_working(turn_in_progress, eff_mtime, sub_files, wf_latest=0.0, proc_alive=None):
     """Office (working) vs kitchen (waiting), decided by TURN STATE + rollups.
 
     Working when the latest turn is still in progress, OR a background subagent
@@ -565,8 +610,20 @@ def _is_working(turn_in_progress, eff_mtime, sub_files, wf_latest=0.0):
     Either way a turn completely silent past the staleness cap is considered abandoned
     and sent to the kitchen so it can't occupy a desk indefinitely.
 
+    ``proc_alive`` (from _session_pid_map()) is a DEFINITIVE signal when available (True/
+    False), unlike everything else here which is inferred from transcript silence -- if we
+    know for a fact the process behind this session has exited, it cannot possibly still be
+    working, no matter how in-progress the turn looks or how fresh the transcript's mtime
+    is (the process could have died mid-write). This is what actually fixes a session
+    killed mid-tool-call (closed terminal, crash, machine sleep) showing "working" for the
+    rest of the staleness-cap window: we now know instantly instead of waiting it out.
+    ``None`` means "couldn't determine" (no session file, not a Claude-desktop/CLI session,
+    e.g. Cursor/Notion/scheduled runs) -- falls through to the heuristics below unchanged.
+
     Computed fresh per request (depends on wall-clock vs the rolled-up mtimes).
     """
+    if proc_alive is False:
+        return False
     now = time.time()
     eff = max(eff_mtime, wf_latest or 0.0)
     if (now - eff) > WORKING_STALE_CAP_SECONDS:
@@ -1770,9 +1827,27 @@ def _enabled_sources(sources):
     return [s for s in _SOURCES if s[0] in want]
 
 
+def _proc_alive_for(src, uuid, pid_map):
+    """Resolve the definitive proc_alive tri-state for _is_working. Only the 'claude'
+    (desktop/CLI) source ever has a ~/.claude/sessions/<pid>.json -- Cursor/Notion/Home
+    sessions have no such file and stay None (unknown -> heuristics decide as before)."""
+    if src != "claude":
+        return None
+    pids = pid_map.get(uuid)
+    if not pids:
+        return None
+    flags = [_pid_alive(p) for p in pids]
+    if any(f is True for f in flags):
+        return True
+    if flags and all(f is False for f in flags):
+        return False
+    return None
+
+
 def get_agents(hours, full=False, project_filter=None, sources=None):
     cutoff = time.time() - hours * 3600
     agents = []
+    pid_map = _session_pid_map()
     for _src, discover, parse in _enabled_sources(sources):
         for uuid, project, path, mtime, _sub_files in discover():
             if mtime < cutoff:
@@ -1791,7 +1866,8 @@ def get_agents(hours, full=False, project_filter=None, sources=None):
             # recompute status fresh each request: parse is cached, but working/
             # kitchen depends on wall-clock (the staleness cap + subagent freshness)
             # vs the turn state, so it can change even when the transcript hasn't.
-            a["status"] = "working" if _is_working(a.get("turn_in_progress"), mtime, _sub_files, wf_latest) else "waiting"
+            proc_alive = _proc_alive_for(_src, uuid, pid_map)
+            a["status"] = "working" if _is_working(a.get("turn_in_progress"), mtime, _sub_files, wf_latest, proc_alive) else "waiting"
             # parent is "self active" only while its OWN turn is in progress; when it's merely
             # working because a subagent/workflow is live, the desk should stop typing (item 8).
             a["self_active"] = bool(a.get("turn_in_progress")) and a["status"] == "working"
@@ -1837,7 +1913,8 @@ def get_agent_detail(uuid):
                 else:
                     wf_runs, wf_latest = [], 0.0
                 d["workflows"] = wf_runs
-                d["status"] = "working" if _is_working(d.get("turn_in_progress"), mtime, _sub_files, wf_latest) else "waiting"
+                proc_alive = _proc_alive_for(_src, uuid, _session_pid_map())
+                d["status"] = "working" if _is_working(d.get("turn_in_progress"), mtime, _sub_files, wf_latest, proc_alive) else "waiting"
                 d["last_activity_rel"] = _rel_time(time.time() - mtime)
                 d["subagents"] = _subagent_infos(_sub_files)
                 d["subs"] = len(d["subagents"])
